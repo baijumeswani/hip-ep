@@ -38,6 +38,7 @@ add_library(OnnxToHip STATIC
   OnnxRotaryEmbeddingConversion.cpp
   GqaConversion.cpp
   PagedAttentionConversion.cpp
+  QwenHybridConversion.cpp
   MultiHeadAttentionConversion.cpp
   AttentionConversion.cpp
   OnnxAttentionConversion.cpp

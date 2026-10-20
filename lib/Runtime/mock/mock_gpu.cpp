@@ -506,6 +506,41 @@ int wrap_rocmlir(RuntimeState *state, const char *kernel_binary,
   return 0;
 }
 
+static int RejectQwenHybrid(RuntimeState *state) {
+  MOCK_PRINT("[MOCK] Qwen hybrid numerical execution requires the real HIP "
+             "runtime\n");
+  if (state)
+    if (auto *error = hipdnn_ep_state_get_error_flag_device_ptr(state))
+      std::memset(error, 0xff, sizeof(int));
+  return -1;
+}
+
+int wrap_varlen_causal_conv(RuntimeState *state, void *, void *, void *, void *,
+                            void *, void *, void *, int64_t, int64_t, int64_t,
+                            int64_t, int64_t, int64_t, int64_t) {
+  return RejectQwenHybrid(state);
+}
+
+int wrap_varlen_gated_delta_net(RuntimeState *state, void *, void *, void *,
+                                void *, void *, void *, void *, void *, void *,
+                                void *, void *, int64_t, int64_t, int64_t,
+                                int64_t, int64_t, int64_t, int64_t, int64_t,
+                                int64_t, int64_t, int64_t, float, int64_t) {
+  return RejectQwenHybrid(state);
+}
+
+int wrap_hybrid_gated_rms_norm(RuntimeState *state, void *, void *, void *,
+                               void *, int64_t, int64_t, int64_t, int64_t,
+                               float, int64_t) {
+  return RejectQwenHybrid(state);
+}
+
+int wrap_packed_mrotary_embedding(RuntimeState *state, void *, void *, void *,
+                                  void *, void *, int64_t, int64_t, int64_t,
+                                  int64_t, int64_t, int64_t) {
+  return RejectQwenHybrid(state);
+}
+
 int wrap_paged_attention(RuntimeState *state, void *, void *, void *, void *,
                          void *, void *, void *, void *, void *, void *, void *,
                          int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
@@ -516,6 +551,26 @@ int wrap_paged_attention(RuntimeState *state, void *, void *, void *, void *,
   if (auto *error = hipdnn_ep_state_get_error_flag_device_ptr(state))
     std::memset(error, 0xff, sizeof(int));
   return -1;
+}
+
+int wrap_paged_attention_separate(RuntimeState *state, void *, void *, void *,
+                                  void *, void *, void *, void *, void *,
+                                  void *, void *, void *, int64_t, int64_t,
+                                  int64_t, int64_t, int64_t, int64_t, int64_t,
+                                  int64_t, int64_t, int64_t, int64_t, int64_t,
+                                  int64_t, int64_t, int64_t, int64_t, int64_t,
+                                  int64_t, float, int64_t) {
+  return RejectQwenHybrid(state);
+}
+
+int wrap_paged_attention_int8(RuntimeState *state, int, void *, void *, void *,
+                              void *, void *, void *, void *, void *, void *,
+                              void *, void *, void *, void *, int64_t, int64_t,
+                              int64_t, int64_t, int64_t, int64_t, int64_t,
+                              int64_t, int64_t, int64_t, int64_t, int64_t,
+                              int64_t, int64_t, int64_t, int64_t, int64_t,
+                              int64_t, float, int64_t) {
+  return RejectQwenHybrid(state);
 }
 
 int wrap_group_query_attention_host_length(

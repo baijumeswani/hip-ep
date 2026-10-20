@@ -48,6 +48,8 @@ struct MorphizenOrtApiExt : public morphizen::OrtApiForMorphizen {
 
   morphizen::DllSafe<std::vector<morphizen::NodeInput>> (
       *node_get_implicit_inputs_unsafe)(const morphizen::Node &node);
+
+  bool (*node_has_subgraphs)(const morphizen::Node &node);
 };
 
 /**

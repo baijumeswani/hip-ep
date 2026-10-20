@@ -190,6 +190,13 @@ static void initialize_mlir_api() {
   };
 
   // Graph API functions [7-23] - Basic implementations
+  the_mlir_instance_of_morphizen_ort_api.node_has_subgraphs =
+      [](const morphizen::Node &node) {
+        return reinterpret_cast<mlir::Operation *>(
+                   const_cast<morphizen::Node *>(&node))
+                   ->getNumRegions() != 0;
+      };
+
   the_mlir_instance_of_morphizen_ort_api.graph_get_name =
       [](const morphizen::Graph &graph) -> const std::string & {
     auto *mlir_graph = reinterpret_cast<const mlir_impl::MLIRGraph *>(&graph);

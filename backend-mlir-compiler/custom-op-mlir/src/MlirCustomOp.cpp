@@ -15,6 +15,7 @@
 #include "metadata.pb.h"
 
 // Component headers
+#include "../../common/artifact_manifest.hpp"
 #include "InferenceState.h"
 #include "hip/Compiler/RocMlirArtifactTarget.h"
 #include "hip/env.h" // shared cross-platform env reader (single Win32 call)
@@ -229,16 +230,16 @@ mlir_metadata::Metadata parse_metadata_from_metadef(
   return metadata;
 }
 
-// Load artifact bytes from EPContext file stream
-// Logs FATAL and terminates on failure
+// Load artifact bytes from EPContext file stream.
 std::vector<uint8_t> load_artifact_from_epcontext(
     const std::shared_ptr<const morphizen::PassContext> &context,
     const std::string &artifact_filename) {
 
   auto artifact_stream = context->open_file_for_read(artifact_filename);
   if (!artifact_stream) {
-    LOG(FATAL) << "Failed to open artifact from EPContext: "
-               << artifact_filename;
+    throw morphizen::ArtifactCompatibilityError(
+        "HIP compiled artifact is missing from EPContext: " +
+        artifact_filename);
   }
 
   std::vector<uint8_t> artifact_bytes;
@@ -262,7 +263,8 @@ std::vector<uint8_t> load_artifact_from_epcontext(
   }
 
   if (artifact_bytes.empty()) {
-    LOG(FATAL) << "Failed to read artifact bytes from EPContext";
+    throw morphizen::ArtifactCompatibilityError(
+        "HIP compiled artifact is empty in EPContext: " + artifact_filename);
   }
 
   MY_LOG(1) << "Loaded artifact: " << total_read << " bytes";
@@ -294,12 +296,7 @@ customop::ArtifactKind determine_artifact_kind(const std::string &format_str) {
   return kind;
 }
 
-// The cache / EPContext identity is derived from the graph only, so a cached
-// artifact is reused regardless of GPU or HIPDNN_EP_ROCMLIR. One that embeds
-// rocMLIR code objects for another chip would load and then fail at the first
-// dispatch, and one built with the opposite HIPDNN_EP_ROCMLIR or
-// HIPDNN_EP_ROCMLIR_AUTOTUNE setting silently ignores the switch. Refuse all of
-// them instead of running a stale artifact.
+// Keep the explicit rocMLIR check alongside the full compatibility manifest.
 void check_rocmlir_arch(const std::string &recorded) {
   const std::string current = hip::compiler::rocMlirArtifactTarget();
   if (recorded == current)
@@ -682,6 +679,14 @@ MlirCustomOp::MlirCustomOp(
 
   // Parse metadata from JSON
   metadata_ = parse_metadata_from_metadef(context, meta_def);
+  mlir_compilation::validateArtifactCompatibility(
+      {metadata_.compatibility().begin(), metadata_.compatibility().end()},
+      mlir_compilation::artifactCompatibility(*context));
+  if (metadata_.source_model_sha256() !=
+      context->get_context_proto().source_model_sha256()) {
+    throw morphizen::ArtifactCompatibilityError(
+        "HIP artifact source model/weight identity differs from its context.");
+  }
   check_rocmlir_arch(metadata_.rocmlir_arch());
   // Precompute index mappings (compiler order -> ORT kernel context order)
   input_index_map_ = build_input_index_map(*meta_def);
@@ -713,6 +718,28 @@ MlirCustomOp::MlirCustomOp(
       }};
   auto artifact_bytes =
       load_artifact_from_epcontext(context, metadata_.artifact_filename());
+  if (metadata_.artifact_sha256() !=
+      mlir_compilation::artifactSha256(artifact_bytes.data(),
+                                       artifact_bytes.size())) {
+    throw morphizen::ArtifactCompatibilityError(
+        "HIP compiled artifact checksum mismatch; regenerate the artifact.");
+  }
+  if (metadata_.external_dependency_count() != metadata_.file_sha256().size()) {
+    throw morphizen::ArtifactCompatibilityError(
+        "HIP artifact externalized-weight identity set is incomplete.");
+  }
+  for (const auto &[filename, digest] : metadata_.file_sha256()) {
+    if (filename.empty() ||
+        std::filesystem::path(filename).filename() != filename) {
+      throw morphizen::ArtifactCompatibilityError(
+          "HIP artifact has an unsupported dependency: " + filename);
+    }
+    auto reader = context->open_file_for_read(filename);
+    if (!reader || mlir_compilation::artifactFileSha256(*reader) != digest) {
+      throw morphizen::ArtifactCompatibilityError(
+          "HIP artifact externalized-weight checksum mismatch: " + filename);
+    }
+  }
   auto kind = determine_artifact_kind(metadata_.artifact_format());
   inference_state_ =
       customop::InferenceState::create(artifact_bytes, fs.get(), &config, kind);

@@ -32,6 +32,7 @@ target_link_libraries(${LIB_NAME} PRIVATE
     mlir_compilation_proto  # Shared protobuf library
     cpptrace::cpptrace
     LibHipCompiler  # rocMlirArtifactTarget, recorded in the artifact metadata
+    runtime-bc-embed
 )
 
 # Include directories
@@ -40,7 +41,13 @@ target_include_directories(${LIB_NAME} PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}/..  # For generated proto headers from parent
     ${CMAKE_SOURCE_DIR}/include     # Shared project headers (timing.h, etc.)
     ${CMAKE_SOURCE_DIR}/lib/Support # CrashHandler.h
+    ${LLVM_INCLUDE_DIRS}
 )
+
+if(HIPDNN_EP_LINK_HIP_HOST)
+    target_compile_definitions(${LIB_NAME} PRIVATE HIPDNN_EP_LINK_HIP_HOST=1)
+    target_link_libraries(${LIB_NAME} PRIVATE hip::host)
+endif()
 
 target_compile_definitions(${LIB_NAME} PRIVATE
     -DOUTPUT_NAME="morphizen-level1-pass-mlir-compiler"

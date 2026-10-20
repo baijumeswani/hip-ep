@@ -12,6 +12,7 @@
 #include <morphizen/morphizen_gsl.h>
 #include <morphizen/my_ort.h>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 #ifdef _WIN32
 #define fseek64 _fseeki64
@@ -166,4 +167,9 @@ MORPHIZEN_DLL_SPEC std::string
 get_md5_of_file(const std::filesystem::path &path);
 MORPHIZEN_DLL_SPEC std::string get_md5_of_buffer(const char *buffer,
                                                  size_t size);
+
+class ArtifactCompatibilityError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 } // namespace morphizen

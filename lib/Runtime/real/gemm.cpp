@@ -507,7 +507,8 @@ static int enumerateGemmAlgos(
 }
 
 // Benchmark `returned` candidates in `heurs` and return the index of the
-// measured fastest (defaults to 0 if timing setup fails). Times into a
+// measured fastest (defaults to 0 if timing setup fails, -1 on workspace
+// failure). Times into a
 // throwaway scratch buffer with beta=0 so the caller's real output is never
 // disturbed (on the broadcast path it already holds beta*C and would otherwise
 // accumulate across timing iterations).
@@ -530,7 +531,9 @@ static int benchmarkGemmAlgos(
       maxws = heurs[i].workspaceSize;
   void *bench_ws = nullptr;
   size_t bench_ws_size = 0;
-  if (maxws > 0 && hipdnn_ep_state_ensure_workspace(state, maxws) == 0) {
+  if (maxws > 0) {
+    if (hipdnn_ep_state_ensure_workspace(state, maxws) != 0)
+      return -1;
     bench_ws = hipdnn_ep_state_get_workspace(state);
     bench_ws_size = hipdnn_ep_state_get_workspace_size(state);
   }
@@ -584,13 +587,16 @@ static int benchmarkGemmAlgos(
 // benchmark them (when more than one), and build the cache entry. Falls back to
 // hipBLASLt's internal default kernel (use_default_algo, algo=nullptr at call
 // time) when no heuristic algorithm can be found.
-static GemmCacheEntry selectGemmAlgo(
-    RuntimeState *state, hipblasLtHandle_t handle,
-    hipblasLtMatmulDesc_t matmul_desc, hipblasLtMatrixLayout_t matA_layout,
-    hipblasLtMatrixLayout_t matB_layout, hipblasLtMatrixLayout_t matC_layout,
-    const void *A, const void *B, float alpha, int64_t M, int64_t N, int64_t K,
-    int64_t transA, int64_t transB, int64_t typeCode, hipDataType dataType,
-    hipblasComputeType_t computeType, hipStream_t stream) {
+static int selectGemmAlgo(RuntimeState *state, hipblasLtHandle_t handle,
+                          hipblasLtMatmulDesc_t matmul_desc,
+                          hipblasLtMatrixLayout_t matA_layout,
+                          hipblasLtMatrixLayout_t matB_layout,
+                          hipblasLtMatrixLayout_t matC_layout, const void *A,
+                          const void *B, float alpha, int64_t M, int64_t N,
+                          int64_t K, int64_t transA, int64_t transB,
+                          int64_t typeCode, hipDataType dataType,
+                          hipblasComputeType_t computeType, hipStream_t stream,
+                          GemmCacheEntry &entry) {
   constexpr int kMaxCandidates = 16;
   hipblasLtMatmulHeuristicResult_t heurs[kMaxCandidates];
 
@@ -598,7 +604,6 @@ static GemmCacheEntry selectGemmAlgo(
       handle, matmul_desc, matA_layout, matB_layout, matC_layout, alpha, transA,
       transB, dataType, computeType, heurs, kMaxCandidates);
 
-  GemmCacheEntry entry;
   if (returned > 0) {
     int best_idx =
         (returned > 1)
@@ -606,6 +611,8 @@ static GemmCacheEntry selectGemmAlgo(
                                  matB_layout, matC_layout, A, B, alpha, M, N,
                                  dataType, stream, heurs, returned)
             : 0;
+    if (best_idx < 0)
+      return -1;
     entry.algo = heurs[best_idx].algo;
     entry.workspace_size = heurs[best_idx].workspaceSize;
     entry.use_default_algo = false;
@@ -619,7 +626,7 @@ static GemmCacheEntry selectGemmAlgo(
     entry.workspace_size = 0;
     entry.use_default_algo = true;
   }
-  return entry;
+  return 0;
 }
 
 // =============================================================================
@@ -840,13 +847,15 @@ int wrap_gemm(RuntimeState *state, int op_state_slot, const void *A,
 
   // Algorithm selection with caching. On a cold miss, select (enumerate +
   // benchmark) the algo for this problem shape, then publish it to the
-  // process-wide cache. selectGemmAlgo never throws and always yields a usable
-  // entry (a concrete algo, or use_default_algo for shapes with no heuristic).
+  // process-wide cache only after selection succeeds.
   if (!have_cached) {
-    GemmCacheEntry entry =
-        selectGemmAlgo(state, handle, matmul_desc, matA_layout, matB_layout,
+    GemmCacheEntry entry;
+    if (selectGemmAlgo(state, handle, matmul_desc, matA_layout, matB_layout,
                        matC_layout, A, B, alpha, M, N, K, transA, transB,
-                       typeCode, dataType, computeType, stream);
+                       typeCode, dataType, computeType, stream, entry) != 0) {
+      result = -1;
+      goto cleanup;
+    }
     {
       std::lock_guard<std::mutex> lk(table.mu);
       // Another thread may have inserted this key meanwhile; try_emplace keeps

@@ -590,7 +590,9 @@ constexpr int kWFragM = 2;
 constexpr int kWFragN = 2;
 constexpr int kWWavesM = kTileCo / (kWFragM * kWmmaDim); // 2
 constexpr int kWWavesN = kTileP / (kWFragN * kWmmaDim);  // 2
-constexpr int kWmmaBlock = kWWavesM * kWWavesN * HIPDNN_WAVE_SIZE;
+// This gfx11-only layout stays wave32 even when compiled into a CDNA image.
+constexpr int kWmmaWaveSize = 32;
+constexpr int kWmmaBlock = kWWavesM * kWWavesN * kWmmaWaveSize;
 
 // Row stride of every staged tile, in dwords.
 //
@@ -673,10 +675,10 @@ __global__ __launch_bounds__(kWmmaBlock) void qconv_tiled_wmma_kernel(
   const uint32_t co_base = blockIdx.y * kTileCo;
 
   const int tid = threadIdx.x;
-  const int lane = tid % HIPDNN_WAVE_SIZE;
+  const int lane = tid % kWmmaWaveSize;
   const int lane16 = lane % kWmmaDim;
   const int pair = lane / kWmmaDim;
-  const int wave = tid / HIPDNN_WAVE_SIZE;
+  const int wave = tid / kWmmaWaveSize;
   const int co_frag0 = (wave % kWWavesM) * kWFragM * kWmmaDim;
   const int p_frag0 = (wave / kWWavesM) * kWFragN * kWmmaDim;
 

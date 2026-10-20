@@ -482,6 +482,18 @@ int wrap_rocmlir(RuntimeState *state, const char *kernel_binary,
   return 0;
 }
 
+int wrap_paged_attention(RuntimeState *state, void *, void *, void *, void *,
+                         void *, void *, void *, void *, void *, void *, void *,
+                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                         int64_t, float) {
+  MOCK_PRINT("[MOCK] PagedAttention numerical execution requires the real HIP "
+             "runtime\n");
+  if (auto *error = hipdnn_ep_state_get_error_flag_device_ptr(state))
+    std::memset(error, 0xff, sizeof(int));
+  return -1;
+}
+
 int wrap_group_query_attention(
     RuntimeState *state, int op_state_slot,
     // Inputs 1-7 (core GQA)

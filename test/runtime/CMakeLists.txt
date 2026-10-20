@@ -37,6 +37,23 @@ add_test(NAME OutputAllocatorUnitTest COMMAND test-output-allocator)
 
 set_target_properties(test-output-allocator PROPERTIES FOLDER "runtime-tests")
 
+add_executable(test-device-scratch
+    test_device_scratch.cpp
+    ${CMAKE_SOURCE_DIR}/lib/Runtime/device_scratch.cpp
+)
+target_compile_features(test-device-scratch PRIVATE cxx_std_17)
+target_compile_definitions(test-device-scratch PRIVATE
+    HIPDNN_EP_RT_NO_EXPORT
+    HIPDNN_EP_REAL_RUNTIME
+)
+target_include_directories(test-device-scratch PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/Runtime
+    ${CMAKE_SOURCE_DIR}/lib/Runtime/mock
+    ${CMAKE_SOURCE_DIR}/lib/Runtime/Kernels/include
+)
+add_test(NAME DeviceScratchUnitTest COMMAND test-device-scratch)
+set_target_properties(test-device-scratch PROPERTIES FOLDER "runtime-tests")
+
 # GQA offline autotune tests are GPU-free: they link the real embedded table
 # (lut/gfx1151.fb) and drive the same resolver that ships in
 # custom_kernels_<arch>, through the exported extern "C" shims. The resolver's

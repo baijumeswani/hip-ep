@@ -2351,6 +2351,16 @@ MutableOperandRange GqaOp::getDpsInitsMutable() {
   return MutableOperandRange(*this, /*start=*/numInputs, /*length=*/numInits);
 }
 
+MutableOperandRange PagedAttentionOp::getDpsInitsMutable() {
+  return MutableOperandRange(*this, 9, 3);
+}
+
+void PagedAttentionOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
 void GqaOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {

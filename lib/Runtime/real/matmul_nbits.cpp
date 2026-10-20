@@ -18,6 +18,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -207,12 +209,6 @@ extern "C" void hipdnn_ep_zp_unpack_cache_destroy(void *cache_ptr) {
 struct MatmulNbitsState : OpStateT<MatmulNbitsState> {
   hipdnn_ep_real::ZpUnpackCache zp;
 
-  // CDNA/wave64 prefill fast path: dequantized fp16 weights, keyed by the
-  // packed-B device pointer (stable for the model's lifetime, so each weight
-  // is dequantized at most once and reused across every prefill call).
-  std::mutex b_mu;
-  std::unordered_map<const void *, std::pair<void *, size_t>> b_fp16;
-
   // Per-shape hipBLASLt algo cache for the prefill GEMM. hipBLASLt's default
   // internal kernel (algo=nullptr) is pathologically slow for some transposed
   // small-N shapes, so we enumerate + cache a concrete supported algo per
@@ -226,7 +222,7 @@ struct MatmulNbitsState : OpStateT<MatmulNbitsState> {
   std::unordered_map<uint64_t, PrefillAlgo> prefill_algos;
 
   // fp32 -> fp16 cast of the `scales` buffer, keyed by the packed-scales
-  // device pointer (stable for the model's lifetime, like `b_fp16` above).
+  // device pointer (stable for the model's lifetime).
   // ONNX MatMulNBits allows scales to be fp16 or fp32 independent of the
   // packed-weight dtype; every dequant kernel below reads `scales` as raw
   // fp16, so a fp32 scales buffer is converted once and reused for every
@@ -235,8 +231,6 @@ struct MatmulNbitsState : OpStateT<MatmulNbitsState> {
   std::unordered_map<const void *, std::pair<void *, size_t>> scale_fp16;
 
   ~MatmulNbitsState() {
-    for (auto &[k, v] : b_fp16)
-      hipFree(v.first);
     for (auto &[k, v] : scale_fp16)
       hipFree(v.first);
   }
@@ -255,8 +249,8 @@ extern "C" int8_t hipdnn_ep_op_state_construct_matmul_nbits(RuntimeState *state,
 // exist only on RDNA3/RDNA4 (wave32). On CDNA (wave64, e.g. MI350X) M>=16
 // prefill would otherwise fall to the naive O(M*N*K) per-element kernel, which
 // is orders of magnitude too slow. Instead we dequantize the (constant) int4
-// weight to fp16 once, cache it, and run a hipBLASLt fp16 GEMM (MFMA) for every
-// subsequent prefill call.
+// weight into one reusable per-session buffer and run a hipBLASLt fp16 GEMM
+// (MFMA). Keeping every expanded weight would erase weight-only VRAM savings.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -293,42 +287,10 @@ static bool shouldPadRow(int64_t K) {
   return a >= 8;
 }
 
-// Returns the cached row-major fp16 [N,K] dequant of `B`, dequantizing on the
-// first use for this weight pointer. Returns nullptr on hipMalloc failure.
-const void *get_or_dequant_b_fp16(MatmulNbitsState *mst, void *stream,
-                                  const void *B, const void *scales_fp16,
-                                  const void *zeros_fp16, int N, int K,
-                                  int group_size) {
-  const size_t bytes =
-      static_cast<size_t>(N) * static_cast<size_t>(K) * sizeof(__fp16);
-
-  std::lock_guard<std::mutex> lock(mst->b_mu);
-  auto it = mst->b_fp16.find(B);
-  if (it != mst->b_fp16.end() && it->second.second >= bytes)
-    return it->second.first;
-
-  void *dst = nullptr;
-  if (hipMalloc(&dst, bytes) != hipSuccess) {
-    fprintf(stderr, "matmul_nbits: hipMalloc(%zu) for fp16 B cache failed\n",
-            bytes);
-    return nullptr;
-  }
-  hip_matmul_nbits_dequant_b_fp16(stream, B, scales_fp16, zeros_fp16, dst, N, K,
-                                  group_size);
-
-  if (it != mst->b_fp16.end()) {
-    hipFree(it->second.first);
-    it->second = {dst, bytes};
-  } else {
-    mst->b_fp16.emplace(B, std::make_pair(dst, bytes));
-  }
-  return dst;
-}
-
 // Returns a cached fp16 cast of `scales_fp32` ([N, num_groups_k] flat, fp32),
 // converting on first use for this weight's scales pointer. scales are model
 // constants, so the conversion cost is a one-time hit per session (mirrors
-// get_or_dequant_b_fp16 above). Returns nullptr on hipMalloc failure.
+// the zero-point cache). Returns nullptr on hipMalloc failure.
 const void *lookup_or_convert_scale_fp16(MatmulNbitsState *mst, void *stream,
                                          const void *scales_fp32,
                                          int64_t n_elems) {
@@ -436,6 +398,9 @@ int matmul_nbits_prefill_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
       // (algo=nullptr) is used only if no candidate can be timed -- it is a
       // good path for large N but pathologically slow for some small-N shapes.
       constexpr int kMax = 24;
+      const char *autotune = std::getenv("HIPDNN_EP_AUTOTUNE");
+      const bool do_autotune = !autotune || std::strcmp(autotune, "0") != 0;
+      const int candidate_limit = do_autotune ? kMax : 1;
       std::vector<hipblasLtMatmulHeuristicResult_t> cands;
       {
         hipblasLtMatmulPreference_t pref = nullptr;
@@ -447,7 +412,8 @@ int matmul_nbits_prefill_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
           hipblasLtMatmulHeuristicResult_t heur[kMax];
           int returned = 0;
           hipblasLtMatmulAlgoGetHeuristic(handle, desc, matA, matB, matD, matD,
-                                          pref, kMax, heur, &returned);
+                                          pref, candidate_limit, heur,
+                                          &returned);
           for (int i = 0; i < returned; ++i)
             cands.push_back(heur[i]);
           hipblasLtMatmulPreferenceDestroy(pref);
@@ -460,7 +426,7 @@ int matmul_nbits_prefill_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
                 HIP_R_16F, HIP_R_16F, HIP_R_16F, HIP_R_16F, HIPBLAS_COMPUTE_32F,
                 all) == HIPBLAS_STATUS_SUCCESS) {
           for (auto &r : all) {
-            if (static_cast<int>(cands.size()) >= kMax)
+            if (static_cast<int>(cands.size()) >= candidate_limit)
               break;
             size_t need = 0;
             if (hipblaslt_ext::matmulIsAlgoSupported(
@@ -473,69 +439,82 @@ int matmul_nbits_prefill_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
         }
       }
 
-      // Time every candidate (warmup + 3 iters), plus the default kernel
-      // (algo=nullptr), and keep the fastest.
-      size_t maxws = 0;
-      for (auto &c : cands)
-        if (c.workspaceSize > maxws)
-          maxws = c.workspaceSize;
-      void *bench_ws = nullptr;
-      size_t bench_ws_size = 0;
-      if (maxws > 0 && hipdnn_ep_state_ensure_workspace(state, maxws) == 0) {
-        bench_ws = hipdnn_ep_state_get_workspace(state);
-        bench_ws_size = hipdnn_ep_state_get_workspace_size(state);
-      }
-      void *bench_out = nullptr;
-      size_t bench_bytes =
-          static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(__fp16);
-      hipEvent_t bs = nullptr, be = nullptr;
-      double best_ms = 1e30;
-      if (bench_bytes > 0 && hipMalloc(&bench_out, bench_bytes) == hipSuccess &&
-          hipEventCreate(&bs) == hipSuccess &&
-          hipEventCreate(&be) == hipSuccess) {
-        // Candidate index -1 == the default internal kernel (algo=nullptr).
-        for (int i = -1; i < static_cast<int>(cands.size()); ++i) {
-          size_t wss = (i < 0) ? 0 : cands[i].workspaceSize;
-          if (wss > bench_ws_size)
-            continue;
-          void *wsp = (wss > 0) ? bench_ws : nullptr;
-          hipblasLtMatmulAlgo_t *ap = (i < 0) ? nullptr : &cands[i].algo;
-          auto run = [&]() {
-            return hipblasLtMatmul(handle, desc, &alpha, Bfp16, matA, A, matB,
-                                   &beta, bench_out, matD, bench_out, matD, ap,
-                                   wsp, wss, stream);
-          };
-          if (run() != HIPBLAS_STATUS_SUCCESS)
-            continue;
-          if (hipEventRecord(bs, stream) != hipSuccess)
-            continue;
-          for (int r = 0; r < 3; ++r)
-            run();
-          if (hipEventRecord(be, stream) != hipSuccess)
-            continue;
-          if (hipEventSynchronize(be) != hipSuccess)
-            continue;
-          float ms = 0.0f;
-          if (hipEventElapsedTime(&ms, bs, be) != hipSuccess)
-            continue;
-          if (ms < best_ms) {
-            best_ms = ms;
-            if (i < 0) {
-              have_algo = false; // default kernel wins
-            } else {
-              chosen.algo = cands[i].algo;
-              chosen.ws = cands[i].workspaceSize;
-              have_algo = true;
+      if (!do_autotune) {
+        if (!cands.empty()) {
+          chosen.algo = cands.front().algo;
+          chosen.ws = cands.front().workspaceSize;
+          have_algo = true;
+        }
+      } else {
+        // Time every candidate (warmup + 3 iters), plus the default kernel
+        // (algo=nullptr), and keep the fastest.
+        size_t maxws = 0;
+        for (auto &c : cands)
+          if (c.workspaceSize > maxws)
+            maxws = c.workspaceSize;
+        void *bench_ws = nullptr;
+        size_t bench_ws_size = 0;
+        if (maxws > 0) {
+          if (hipdnn_ep_state_ensure_workspace(state, maxws) != 0) {
+            result = -1;
+            goto cleanup;
+          }
+          bench_ws = hipdnn_ep_state_get_workspace(state);
+          bench_ws_size = hipdnn_ep_state_get_workspace_size(state);
+        }
+        void *bench_out = nullptr;
+        size_t bench_bytes =
+            static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(__fp16);
+        hipEvent_t bs = nullptr, be = nullptr;
+        double best_ms = 1e30;
+        if (bench_bytes > 0 &&
+            hipMalloc(&bench_out, bench_bytes) == hipSuccess &&
+            hipEventCreate(&bs) == hipSuccess &&
+            hipEventCreate(&be) == hipSuccess) {
+          // Candidate index -1 == the default internal kernel (algo=nullptr).
+          for (int i = -1; i < static_cast<int>(cands.size()); ++i) {
+            size_t wss = (i < 0) ? 0 : cands[i].workspaceSize;
+            if (wss > bench_ws_size)
+              continue;
+            void *wsp = (wss > 0) ? bench_ws : nullptr;
+            hipblasLtMatmulAlgo_t *ap = (i < 0) ? nullptr : &cands[i].algo;
+            auto run = [&]() {
+              return hipblasLtMatmul(handle, desc, &alpha, Bfp16, matA, A, matB,
+                                     &beta, bench_out, matD, bench_out, matD,
+                                     ap, wsp, wss, stream);
+            };
+            if (run() != HIPBLAS_STATUS_SUCCESS)
+              continue;
+            if (hipEventRecord(bs, stream) != hipSuccess)
+              continue;
+            for (int r = 0; r < 3; ++r)
+              run();
+            if (hipEventRecord(be, stream) != hipSuccess)
+              continue;
+            if (hipEventSynchronize(be) != hipSuccess)
+              continue;
+            float ms = 0.0f;
+            if (hipEventElapsedTime(&ms, bs, be) != hipSuccess)
+              continue;
+            if (ms < best_ms) {
+              best_ms = ms;
+              if (i < 0) {
+                have_algo = false; // default kernel wins
+              } else {
+                chosen.algo = cands[i].algo;
+                chosen.ws = cands[i].workspaceSize;
+                have_algo = true;
+              }
             }
           }
         }
+        if (bs)
+          hipEventDestroy(bs);
+        if (be)
+          hipEventDestroy(be);
+        if (bench_out)
+          hipFree(bench_out);
       }
-      if (bs)
-        hipEventDestroy(bs);
-      if (be)
-        hipEventDestroy(be);
-      if (bench_out)
-        hipFree(bench_out);
 
       chosen.has_algo = have_algo;
       mst->prefill_algos.emplace(key, chosen);
@@ -757,7 +736,7 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
     }
   }
 
-  // CDNA/wave64 prefill fast path: dequantize B -> fp16 once and run a
+  // CDNA/wave64 prefill fast path: dequantize B -> fp16 scratch and run a
   // hipBLASLt fp16 GEMM (MFMA). The kernel library's WMMA prefill path is
   // wave32-only, so on wave64 a large-M GEMM would otherwise hit the naive
   // fallback. Only int4 fp16 GEMM shapes (batch==1, K%32==0, M>=16) qualify.
@@ -777,19 +756,21 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
     if (zeros_ok) {
       MatmulNbitsState *mst =
           MatmulNbitsState::get_op_state(state, op_state_slot);
-      if (mst) {
-        const void *b_fp16 = get_or_dequant_b_fp16(
-            mst, stream, B, scales, zeros_fp16, static_cast<int>(N),
-            static_cast<int>(K), static_cast<int>(block_size));
-        if (b_fp16) {
-          result = matmul_nbits_prefill_hipblaslt(mst, state, A, b_fp16, bias,
-                                                  output, M, N, K);
-          goto cleanup;
-        }
+      if (!mst) {
+        fprintf(stderr, "wrap_matmul_nbits: no MatmulNbitsState at slot %d\n",
+                op_state_slot);
+        return -1;
       }
+      const void *b_fp16 = hipdnn_ep_dequant_matmul_nbits_fp16(
+          state, stream, B, scales, zeros_fp16, static_cast<int>(N),
+          static_cast<int>(K), static_cast<int>(block_size));
+      if (!b_fp16)
+        return -1;
+      result = matmul_nbits_prefill_hipblaslt(mst, state, A, b_fp16, bias,
+                                              output, M, N, K);
+      goto cleanup;
     }
-    // Any miss (no op-state, alloc failure, unsupported zp) falls through to
-    // the general kernel dispatch below.
+    // Unsupported zero-point layouts use the general kernel dispatch below.
   }
 
   // RDNA int4 WMMA prefill against a row-padded B, for the K values where the

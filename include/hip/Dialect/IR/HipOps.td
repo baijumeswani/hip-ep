@@ -3732,6 +3732,39 @@ def Hip_CausalConvWithStateOp : Hip_DpsOp<"causal_conv_with_state",
 
 // ===== Group Query Attention =================================================
 
+def Hip_PagedAttentionOp : Hip_DpsOp<"paged_attention"> {
+  let summary = "FP16 packed paged attention with fused half-rotated RoPE";
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$query,
+    Hip_TensorOrMemRef:$past_key,
+    Hip_TensorOrMemRef:$past_value,
+    Hip_TensorOrMemRef:$cumulative_lengths,
+    Hip_TensorOrMemRef:$past_lengths,
+    Hip_TensorOrMemRef:$block_table,
+    Hip_TensorOrMemRef:$cos_cache,
+    Hip_TensorOrMemRef:$sin_cache,
+    Hip_TensorOrMemRef:$output,
+    Hip_TensorOrMemRef:$present_key,
+    Hip_TensorOrMemRef:$present_value,
+    I64Attr:$num_heads,
+    I64Attr:$kv_num_heads,
+    F32Attr:$scale
+  );
+  let assemblyFormat = [{
+    `(` $ctx `)` `ins` `(`
+      $query `,` $past_key `,` $past_value `,` $cumulative_lengths `,`
+      $past_lengths `,` $block_table `,` $cos_cache `,` $sin_cache `:`
+      type($query) `,` type($past_key) `,` type($past_value) `,`
+      type($cumulative_lengths) `,` type($past_lengths) `,`
+      type($block_table) `,` type($cos_cache) `,` type($sin_cache)
+    `)` `outs` `(`
+      $output `,` $present_key `,` $present_value `:`
+      type($output) `,` type($present_key) `,` type($present_value)
+    `)` attr-dict (`:` type($result_tensors)^)?
+  }];
+}
+
 def Hip_GqaOp : Hip_DpsOp<"gqa",
     [AttrSizedOperandSegments, OpStateOpInterface]> {
   let summary = "Group Query Attention - Full MS spec implementation";

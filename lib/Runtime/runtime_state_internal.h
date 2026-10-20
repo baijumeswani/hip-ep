@@ -72,6 +72,12 @@ struct RuntimeState {
   void *workspace;
   size_t workspace_size;
 
+  // Reused by serialized MatMulNBits prefill ops on this session's stream.
+  // Separate from the hipBLASLt workspace, which may grow during GEMM tuning.
+  // Holds only the largest expanded FP16 matrix, not every layer's weights.
+  void *matmul_nbits_fp16_scratch;
+  size_t matmul_nbits_fp16_scratch_size;
+
   // Host-mapped scratch buffer for tiny host-fed scalars routed away from the
   // GPU pool by hip-materialize-host-scalars.
   // hipHostMalloc(hipHostMallocMapped): host-writable AND GPU-readable.
@@ -229,6 +235,9 @@ struct RuntimeState {
   // Device-side error flag used by kernels to report runtime-invalid inputs.
   // 0 = no error, non-zero = error code (currently -1).
   int *device_error_flag;
+  // Sticky host-side failures from runtime calls whose status the graph
+  // ignores.
+  int host_error_flag;
 
   // hipDNN graph execution support.
   // Set by EP via hipdnn_graph_runtime_attach() after inference_init().
@@ -332,5 +341,9 @@ struct RuntimeState {
   void *gqa_fp32_adapter_scratch;
   size_t gqa_fp32_adapter_scratch_size;
 };
+
+const void *hipdnn_ep_dequant_matmul_nbits_fp16(
+    RuntimeState *state, void *stream, const void *weights, const void *scales,
+    const void *zeros, int n, int k, int group_size);
 
 #endif // HIPDNN_EP_RUNTIME_STATE_INTERNAL_H

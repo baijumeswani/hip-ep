@@ -791,7 +791,32 @@ void MlirCustomOp::compute_with_output_allocator(
     timer->record_start();
 #endif
 
-  int ret = inference_state_->compute(&inputs.span);
+  // ORT owns the bound outputs and can release/reuse them as soon as Compute
+  // returns, including on failure. Drain before either those leases or the
+  // stack-resident output callback are released. A failed drain is fail-stop:
+  // returning an ordinary error would permit recycling live device buffers.
+  const auto drain = [&] {
+#ifdef HIPDNN_EP_LINK_HIP_HOST
+    const auto status = hipStreamSynchronize(
+        static_cast<hipStream_t>(inference_state_->get_stream_raw()));
+    if (status != hipSuccess) {
+      std::fprintf(
+          stderr,
+          "HIP compute drain failed; device buffers cannot be released: %s\n",
+          hipGetErrorString(status));
+      std::abort();
+    }
+#endif
+  };
+  int ret;
+  try {
+    ret = inference_state_->compute(&inputs.span);
+  } catch (...) {
+    drain();
+    inference_state_->set_output_allocator(nullptr);
+    throw;
+  }
+  drain();
 
 #ifdef HIPDNN_EP_LINK_HIP_HOST
   if (perf)
@@ -803,7 +828,9 @@ void MlirCustomOp::compute_with_output_allocator(
   inference_state_->set_output_allocator(nullptr);
 
   if (ret != 0) {
-    LOG(ERROR) << "inference_compute (allocator) failed with code: " << ret;
+    throw std::runtime_error(
+        "inference_compute (allocator) failed with code: " +
+        std::to_string(ret));
   }
 
   // Output-completeness guard. Every declared output must be produced in-graph
@@ -813,11 +840,9 @@ void MlirCustomOp::compute_with_output_allocator(
   // silently pass a CPU-vs-CPU comparison).
   for (size_t i = 0; i < octx.allocated.size(); ++i) {
     if (!octx.allocated[i]) {
-      LOG(FATAL) << "output allocator: output '"
-                 << metadata_.outputs()[static_cast<int>(i)].name() << "' (idx "
-                 << i
-                 << ") was never allocated by the model.dll. Passthrough / "
-                    "aliased outputs are not supported yet.";
+      throw std::runtime_error("output allocator: output '" +
+                               metadata_.outputs()[static_cast<int>(i)].name() +
+                               "' was never allocated by the compiled model");
     }
   }
 

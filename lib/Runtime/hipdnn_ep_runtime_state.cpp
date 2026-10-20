@@ -195,6 +195,8 @@ static int initialize_state_handles(RuntimeState **out_state) {
   state->num_buffers = 0;
   state->workspace = nullptr;
   state->workspace_size = 0;
+  state->matmul_nbits_fp16_scratch = nullptr;
+  state->matmul_nbits_fp16_scratch_size = 0;
   state->host_scratch_base = nullptr;
   state->host_scratch_size = 0;
   // Start with no output allocator (null context + callback). The EP installs
@@ -227,6 +229,7 @@ static int initialize_state_handles(RuntimeState **out_state) {
   state->gqa_autotune_policy = nullptr;
   state->provider_options = nullptr;
   state->device_error_flag = nullptr;
+  state->host_error_flag = 0;
   state->hipdnn_handle = nullptr;
   state->hipdnn_graph_registry = nullptr;
   state->seqlens_k_cached_valid = false;
@@ -744,6 +747,9 @@ int hipdnn_ep_state_cleanup(RuntimeState *state) {
   if (state->workspace) {
     HIP_CLEANUP(hipFree(state->workspace));
   }
+  if (state->matmul_nbits_fp16_scratch) {
+    HIP_CLEANUP(hipFree(state->matmul_nbits_fp16_scratch));
+  }
 
   // Free qmoe device scratch + pinned host mirror (if allocated)
   if (state->qmoe_scratch) {
@@ -1229,69 +1235,6 @@ void *hipdnn_ep_get_host_scratch_base(RuntimeState *state, size_t needed_size) {
 }
 
 //===----------------------------------------------------------------------===//
-// Shared Workspace Support
-//===----------------------------------------------------------------------===//
-
-void *hipdnn_ep_state_get_workspace(RuntimeState *state) {
-  return state ? state->workspace : nullptr;
-}
-
-size_t hipdnn_ep_state_get_workspace_size(RuntimeState *state) {
-  return state ? state->workspace_size : 0;
-}
-
-int hipdnn_ep_state_ensure_workspace(RuntimeState *state, size_t needed_size) {
-  if (!state)
-    return -1;
-  if (needed_size == 0)
-    return 0;
-  if (state->workspace_size >= needed_size)
-    return 0;
-
-  // Amortize growth: when enlarging an existing workspace, round the new
-  // size up to at least 1.5x the current buffer. Callers whose request
-  // size grows monotonically by a small increment per inference (e.g. the
-  // GQA decode path, which sizes S buffers to B*H*total_seq and adds B*H
-  // elements per token) would otherwise trigger a hipStreamSynchronize +
-  // hipFree + hipMalloc cycle on every decode step; with the 1.5x factor
-  // that drops to O(log N) reallocations over the whole generation.
-  // Cold-start (no existing workspace) keeps the exact requested size so
-  // warmup doesn't silently double large initial allocations.
-  size_t alloc_size = needed_size;
-  if (state->workspace_size > 0) {
-    size_t grown = state->workspace_size + state->workspace_size / 2; // 1.5x
-    if (grown > alloc_size)
-      alloc_size = grown;
-  }
-
-  // Grow: free old, allocate new.
-  // Sync the stream first to ensure no in-flight kernel is still using the
-  // old workspace buffer (prevents use-after-free on async GPU execution).
-  if (state->workspace) {
-    if (state->stream) {
-      HIP_CLEANUP(hipStreamSynchronize(state->stream));
-    }
-    HIP_CLEANUP(hipFree(state->workspace));
-    state->workspace = nullptr;
-    state->workspace_size = 0;
-  }
-
-  if (hipMalloc(&state->workspace, alloc_size) != hipSuccess) {
-    fprintf(
-        stderr,
-        "hipdnn_ep_state_ensure_workspace: hipMalloc failed for %zu bytes\n",
-        alloc_size);
-    std::abort();
-  }
-
-  state->workspace_size = alloc_size;
-  RUNTIME_DEBUG_LOG(
-      "[workspace] Allocated shared workspace: %zu bytes (requested %zu)\n",
-      alloc_size, needed_size);
-  return 0;
-}
-
-//===----------------------------------------------------------------------===//
 // QMoE scratch helpers (device + pinned-host)
 //===----------------------------------------------------------------------===//
 //
@@ -1717,6 +1660,7 @@ int hipdnn_ep_state_reset_error_flag(RuntimeState *state) {
     fprintf(stderr, "hipdnn_ep_state_reset_error_flag: invalid state\n");
     return -1;
   }
+  state->host_error_flag = 0;
   hipError_t err =
       hipMemsetAsync(state->device_error_flag, 0, sizeof(int), state->stream);
   return (err == hipSuccess) ? 0 : -1;
@@ -1728,6 +1672,8 @@ int hipdnn_ep_state_read_and_clear_error_flag(RuntimeState *state) {
             "hipdnn_ep_state_read_and_clear_error_flag: invalid state\n");
     return -1;
   }
+  if (state->host_error_flag != 0)
+    return state->host_error_flag;
 
   int host_error = 0;
   hipError_t err =

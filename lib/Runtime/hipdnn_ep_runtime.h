@@ -1429,6 +1429,18 @@ int wrap_global_pool(RuntimeState *state, void *input, void *output,
 // without position_ids ships cos/sin already position-expanded to
 // [batch, seq_len, rotary_dim/2], and the kernel indexes them by the flat
 // token position b*seq+s instead of looking up position_ids.
+int wrap_paged_attention(RuntimeState *state, void *query, void *past_key,
+                         void *past_value, void *cumulative_lengths,
+                         void *past_lengths, void *block_table, void *cos_cache,
+                         void *sin_cache, void *output, void *present_key,
+                         void *present_value, int64_t tokens, int64_t batch,
+                         int64_t table_columns, int64_t num_blocks,
+                         int64_t block_size, int64_t num_heads,
+                         int64_t kv_num_heads, int64_t rotary_length,
+                         int64_t cumulative_count, int64_t table_rows,
+                         int64_t value_blocks, int64_t value_block_size,
+                         int64_t sin_length, float scale);
+
 int wrap_rotary_embedding(RuntimeState *state, void *input, void *position_ids,
                           void *cos_cache, void *sin_cache, void *output,
                           int64_t interleaved, int64_t batch_size,

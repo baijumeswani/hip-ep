@@ -928,6 +928,14 @@ HIP_KERNEL_API int hip_softplus(
  *
  * Returns: 0 on success, non-zero on error
  */
+HIP_KERNEL_API int hip_paged_attention_fp16(
+    void *stream, const void *query, void *key_cache, void *value_cache,
+    const int32_t *cumulative_lengths, const int32_t *past_lengths,
+    const int32_t *block_table, const void *cos_cache, const void *sin_cache,
+    void *output, int64_t tokens, int64_t batch, int64_t table_columns,
+    int64_t num_blocks, int64_t block_size, int64_t num_heads,
+    int64_t kv_num_heads, int64_t rotary_length, float scale, void *error_flag);
+
 HIP_KERNEL_API int hip_rope_forward(
     void* stream,
     const void* input,

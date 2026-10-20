@@ -33,6 +33,11 @@ MatMulNBitsToHip::matchAndRewrite(mlir::Operation *op,
   if (!domainAttr || domainAttr.getValue() != "com.microsoft") {
     return rewriter.notifyMatchFailure(op, "not a com.microsoft domain op");
   }
+  auto prepacked = op->getAttrOfType<mlir::IntegerAttr>("weight_prepacked");
+  if (prepacked && prepacked.getInt() != 0) {
+    return op->emitError("MatMulNBits: CUDA-prepacked weights are unsupported; "
+                         "expected raw blockwise layout");
+  }
 
   mlir::Location loc = op->getLoc();
 

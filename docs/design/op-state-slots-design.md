@@ -37,6 +37,26 @@ Some operators keep state across a session: attention GEMM descriptors, dequant 
 
 ## Constraints
 
+Shared workspace and MatMulNBits FP16 expansion scratch are session-owned
+transient buffers, not per-op retained weight copies. Their growth helpers in
+`lib/Runtime/device_scratch.cpp` stop on a failed stream drain or free and retain
+the old pointer/capacity. After a successful free, an allocation failure leaves
+a null pointer and zero capacity so a later attempt can retry. Callers must
+propagate these failures rather than treating them as optional tuning failures.
+These helpers also latch a host-side runtime error: generated operator calls
+do not all consume their returned status. The generated inference boundary
+checks this latch alongside device errors and resets it before the next
+inference, so a recoverable allocation failure cannot become successful
+inference with unwritten outputs.
+`DeviceScratchUnitTest` compiles the production helpers with deterministic HIP
+stubs to cover allocation, drain, free, and dequantization-launch errors; it
+does not simulate faults in an actual GPU driver.
+
+For MatMulNBits prefill, explicitly setting `HIPDNN_EP_AUTOTUNE=0` selects one
+supported heuristic algorithm without running candidate timing loops. Leaving
+the variable unset preserves the existing autotuning behavior. This controls
+cold-path tuning, not weight format or precision.
+
 - **Multi-model per process** — many sessions run in one process, so per-op state must not bloat a shared struct and must not outlive its session through a process `static`.
 - **Per-instance isolation** — two operators of the same kind must hold independent state. Three stacked recurrent layers each keep their own hidden state; a single object shared by kind would corrupt them.
 - **Construction from op data** — a slot must be constructible from values the operator knows at compile time (a device id, kernel geometry, a size hint), not only from a bare context pointer.

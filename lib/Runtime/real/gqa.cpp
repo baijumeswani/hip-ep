@@ -1918,9 +1918,9 @@ static int gqa_forward_hipblaslt(
   // their stream syncs with them; that is left for later because the scan is
   // already small against the score GEMMs it bounds, and because such a cache
   // belongs on RuntimeState rather than in a file-static -- per-session, and so
-  // safe against a second session and against teardown. A failure anywhere here
-  // leaves the vector empty and the op scores its full range, which is exactly
-  // the old behaviour.
+  // safe against a second session and against teardown. An optional scan
+  // failure leaves the vector empty and scores the full range; workspace
+  // growth errors still propagate.
   //===--------------------------------------------------------------------===//
   std::vector<int32_t> mask_chunk_hi;
   if (chunked && chunk_narrow_ok && !causal_narrow_ok && attention_bias &&
@@ -1934,9 +1934,10 @@ static int gqa_forward_hipblaslt(
     // dwarfs the few hundred bytes wanted here and the request is a no-op; only
     // a cold first inference pays an extra allocation for it.
     const size_t hi_bytes = static_cast<size_t>(nchunks) * sizeof(int32_t);
-    int32_t *d_hi = nullptr;
-    if (hipdnn_ep_state_ensure_workspace(state, hi_bytes) == 0)
-      d_hi = static_cast<int32_t *>(hipdnn_ep_state_get_workspace(state));
+    if (hipdnn_ep_state_ensure_workspace(state, hi_bytes) != 0)
+      return -1;
+    int32_t *d_hi =
+        static_cast<int32_t *>(hipdnn_ep_state_get_workspace(state));
     if (d_hi &&
         hip_gqa_bias_key_extent(
             stream, attention_bias, d_hi, static_cast<int>(attn_bias_batch),
@@ -1950,8 +1951,7 @@ static int gqa_forward_hipblaslt(
           hipStreamSynchronize(stream) == hipSuccess)
         mask_chunk_hi = std::move(hi);
     }
-    // Never expected: only a failed scratch allocation or a failed launch gets
-    // here, and both mean the prefill silently reverts to scoring every key.
+    // A failed optional scan falls back to scoring every key.
     if (mask_chunk_hi.empty())
       fprintf(stderr,
               "gqa_forward_hipblaslt: mask key-extent recovery failed; "

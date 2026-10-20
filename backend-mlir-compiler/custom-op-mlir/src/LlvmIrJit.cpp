@@ -18,6 +18,7 @@
 #include <llvm/ExecutionEngine/JITSymbol.h>
 #include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+#include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
@@ -644,7 +645,19 @@ LlvmIrJit::create(const std::vector<uint8_t> &bitcode,
   // (x86_64 COFF), JITLink on Linux (x86_64 ELF). Both are linked in (see this
   // dir's CMakeLists) for that reason. makeLLJITBuilder keeps that choice but
   // fixes the Windows memory layout; see the comment there.
-  auto jit_or_err = makeLLJITBuilder().create();
+  auto builder = makeLLJITBuilder();
+#if defined(__linux__) && defined(__x86_64__)
+  auto target_machine = llvm::orc::JITTargetMachineBuilder::detectHost();
+  if (!target_machine) {
+    LOG(ERROR) << "LlvmIrJit::create: detectHost failed: "
+               << llvm::toString(target_machine.takeError());
+    return nullptr;
+  }
+  // runtime.bc and ORC's __dso_handle can be allocated more than 2 GiB apart.
+  target_machine->setCodeModel(llvm::CodeModel::Large);
+  builder.setJITTargetMachineBuilder(std::move(*target_machine));
+#endif
+  auto jit_or_err = builder.create();
   if (!jit_or_err) {
     LOG(ERROR) << "LlvmIrJit::create: LLJITBuilder failed: "
                << llvm::toString(jit_or_err.takeError());

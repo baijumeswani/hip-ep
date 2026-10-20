@@ -29,6 +29,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from onnx import helper
+from onnxruntime.capi.onnxruntime_pybind11_state import RuntimeException
 
 from framework.comparator import compare_outputs
 from framework.onnx_utils import make_model_from_nodes, np_to_onnx_type
@@ -43,6 +44,16 @@ def _make_unary_model(op_type: str, dtype: np.dtype, shape: list[int]):
     Y = helper.make_tensor_value_info("Y", tp, list(shape))
     node = helper.make_node(op_type, ["X"], ["Y"])
     return make_model_from_nodes([node], [X], [Y])
+
+
+def test_unsupported_unary_status_is_not_discarded(model_runner, request):
+    if request.config.getoption("--backend") != "ort_ep" or (
+        "profile=hip" not in request.config.getoption("--ep-option")
+    ):
+        pytest.skip("HIP execution-status contract through the AMDGPU wrapper")
+    model = _make_unary_model("Sigmoid", np.float64, [4])
+    with pytest.raises(RuntimeException, match="inference_compute.*failed"):
+        model_runner.run_sample(model, [np.arange(4, dtype=np.float64)])
 
 
 def _rng_input(rng, dtype: np.dtype, shape: list[int]):

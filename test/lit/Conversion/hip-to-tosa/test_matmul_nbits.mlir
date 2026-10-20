@@ -131,7 +131,7 @@ func.func @matmul_nbits_f32_scales(%ctx: !hip.context, %a: tensor<2x16xf16>,
         outs(%init : tensor<2x2xf16>)
         {K = 16 : i64, N = 2 : i64, bits = 4 : i64, block_size = 16 : i64,
          accuracy_level = 0 : i64, zp_elem_size = 0 : i64,
-         scale_elem_size = 4 : i64} : tensor<2x2xf16>
+         scale_data_type = 0 : i64} : tensor<2x2xf16>
   return %r : tensor<2x2xf16>
 }
 

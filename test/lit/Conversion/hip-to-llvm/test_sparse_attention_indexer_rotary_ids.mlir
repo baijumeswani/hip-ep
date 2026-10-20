@@ -67,6 +67,7 @@
 // CHECK-NEXT:      %[[NOCOUNTS2:.*]] = llvm.mlir.zero : !llvm.ptr
 // CHECK-NEXT:      %[[NOPAIR2:.*]] = llvm.mlir.constant(0 : i64) : i64
 // CHECK-NEXT:      %{{.*}} = llvm.call @wrap_sparse_attention_indexer(%[[CTX]], {{.*}}, %[[MAP2]], %[[M2]], %[[IDS_B2]], %[[IDS_X2]], %[[NOCOUNTS2]], %[[NOPAIR2]])
+// CHECK-NEXT:      llvm.call @hipdnn_ep_state_record_execution_status(%[[CTX]],
 // CHECK-NEXT:      llvm.return
 // CHECK-NEXT:    }
 func.func @sai_rotary_ids(

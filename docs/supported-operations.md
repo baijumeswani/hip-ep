@@ -51,6 +51,13 @@ with and without bias against the ORT CPU implementation.
 
 The target-only hybrid path additionally implements these narrow contracts:
 
+These are packed/variable-length extensions, not replacements for the
+upstream dense operators with the same ONNX names. They lower to
+`hip.varlen_gated_delta_net`, `hip.hybrid_gated_rms_norm`, and
+`hip.packed_mrotary_embedding`; dense forms retain their existing conversion
+and runtime entrypoints. In particular, the upstream dense GatedRMSNorm
+continues to support sigmoid gating.
+
 | Operation (`com.microsoft`) | Contract |
 |---|---|
 | VarlenCausalConvWithState | Matching FP16 or FP32 `[tokens, channels]`, kernel-4 depthwise weights, bias, SiLU, int32 cumulative lengths, and same-type `[batch, channels, 3]` carry. |

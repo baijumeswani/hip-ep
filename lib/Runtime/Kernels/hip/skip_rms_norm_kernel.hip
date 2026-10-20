@@ -35,6 +35,7 @@
 #include "debug_log.h"
 
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -57,9 +58,15 @@ inline int skip_block_size(int64_t norm_size) {
 
 __device__ inline float skip_load(const float *p) { return *p; }
 __device__ inline float skip_load(const __half *p) { return __half2float(*p); }
+__device__ inline float skip_load(const __hip_bfloat16 *p) {
+  return static_cast<float>(*p);
+}
 
 __device__ inline void skip_store(float *p, float v) { *p = v; }
 __device__ inline void skip_store(__half *p, float v) { *p = __float2half(v); }
+__device__ inline void skip_store(__hip_bfloat16 *p, float v) {
+  *p = __hip_bfloat16(v);
+}
 
 __device__ inline float skip_block_sum(float partial, float *s_reduce) {
   s_reduce[threadIdx.x] = partial;
@@ -214,6 +221,11 @@ __device__ inline float4 row_ld4(const __half *p, int64_t i) {
   const float2 b = __half22float2(*reinterpret_cast<const __half2 *>(&u.y));
   return make_float4(a.x, a.y, b.x, b.y);
 }
+__device__ inline float4 row_ld4(const __hip_bfloat16 *p, int64_t i) {
+  p += 4 * i;
+  return make_float4(skip_load(p), skip_load(p + 1), skip_load(p + 2),
+                     skip_load(p + 3));
+}
 __device__ inline void row_st4(float *p, int64_t i, float4 v) {
   reinterpret_cast<float4 *>(p)[i] = v;
 }
@@ -224,6 +236,13 @@ __device__ inline void row_st4(__half *p, int64_t i, float4 v) {
   u.x = *reinterpret_cast<const unsigned *>(&a);
   u.y = *reinterpret_cast<const unsigned *>(&b);
   reinterpret_cast<uint2 *>(p)[i] = u;
+}
+__device__ inline void row_st4(__hip_bfloat16 *p, int64_t i, float4 v) {
+  p += 4 * i;
+  skip_store(p, v.x);
+  skip_store(p + 1, v.y);
+  skip_store(p + 2, v.z);
+  skip_store(p + 3, v.w);
 }
 
 // One block per row. blockDim.x == BS, norm_size % 4 == 0,
@@ -434,7 +453,7 @@ int launch_skip_rms_norm(hipStream_t stream, const void *input,
     fprintf(stderr, "[custom_kernels] hip_skip_rms_norm launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }
 
 } // namespace
@@ -454,6 +473,11 @@ extern "C" int hip_skip_rms_norm(void *stream, const void *input,
         outer, norm_size, epsilon);
   if (hip_dtype == HIP_DTYPE_FLOAT32)
     return launch_skip_rms_norm<float, float, float, float, float>(
+        hip_stream, input, skip, gamma, bias, output, input_skip_bias_sum,
+        outer, norm_size, epsilon);
+  if (hip_dtype == HIP_DTYPE_BFLOAT16)
+    return launch_skip_rms_norm<__hip_bfloat16, __hip_bfloat16, __hip_bfloat16,
+                               __hip_bfloat16, __hip_bfloat16>(
         hip_stream, input, skip, gamma, bias, output, input_skip_bias_sum,
         outer, norm_size, epsilon);
   fprintf(stderr, "[custom_kernels] hip_skip_rms_norm: unsupported dtype=%d\n",

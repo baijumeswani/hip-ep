@@ -17,7 +17,8 @@ module {
         outs(%values, %indices : memref<3x2xf32, 1>, memref<3x2xi64, 1>)
         {axis = 1 : i64, largest = true, sorted = true}
 
-    // CHECK: llvm.call @wrap_top_k({{.*}}) : (!llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, i64, !llvm.ptr, i64, i64) -> i32
+    // CHECK: %[[STATUS:.*]] = llvm.call @wrap_top_k({{.*}}) : (!llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, i64, !llvm.ptr, i64, i64) -> i32
+    // CHECK-NEXT: llvm.call @hipdnn_ep_state_record_execution_status(%{{.*}}, %[[STATUS]]) : (!llvm.ptr, i32) -> ()
     return
   }
 
@@ -41,23 +42,4 @@ module {
     return
   }
 
-  func.func @topk_static_1d_bf16(
-      %ctx: !hip.context,
-      %x: memref<16xbf16, 1>,
-      %k: memref<i64, 1>,
-      %values: memref<4xbf16, 1>,
-      %indices: memref<4xi64, 1>) {
-    // CHECK-LABEL: llvm.func @topk_static_1d_bf16
-
-    hip.top_k(%ctx)
-        ins(%x, %k : memref<16xbf16, 1>, memref<i64, 1>)
-        outs(%values, %indices : memref<4xbf16, 1>, memref<4xi64, 1>)
-        {axis = 0 : i64, largest = true, sorted = true}
-
-    // HIPDNN_EP_DATATYPE_BFLOAT16 = 2. The runtime rejects dtypes the kernel
-    // does not implement.
-    // CHECK: [[DT:%[0-9]+]] = llvm.mlir.constant(2 : i64) : i64
-    // CHECK-NEXT: llvm.call @wrap_top_k({{.*}}, [[DT]]) :
-    return
-  }
 }

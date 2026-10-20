@@ -19,6 +19,10 @@ struct QMoEAmdOpLowering : public ConvertOpToLLVMPattern<QMoEAmdOp> {
   LogicalResult
   matchAndRewrite(QMoEAmdOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (cast<MemRefType>(op.getHiddenStates().getType())
+            .getElementType()
+            .isBF16())
+      return op.emitOpError("BF16 QMoEAmd is not supported");
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
     Type ptrType = getPtrType();

@@ -91,6 +91,8 @@ TopKToHip::matchAndRewrite(mlir::Operation *op,
   mlir::Value x = op->getOperand(0);
   mlir::Value k = op->getOperand(1);
   auto xType = mlir::cast<mlir::RankedTensorType>(x.getType());
+  if (xType.getElementType().isBF16())
+    return op->emitOpError("BF16 TopK is not supported");
 
   int64_t axis = -1;
   if (auto axisAttr = op->getAttrOfType<mlir::IntegerAttr>("axis"))

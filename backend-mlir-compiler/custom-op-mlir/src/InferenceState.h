@@ -25,7 +25,7 @@ class LoadedArtifact;
 // Owns the loaded per-model artifact (via LoadedArtifact) that provides the
 // `inference_*` entry points. The artifact is either an in-process ORC JIT
 // (LLVM IR) or a morphizen::Plugin (native .dll/.so); both expose the
-// identical 5-symbol C ABI, so the cached hot-path function pointers and
+// same versioned C ABI, so the cached hot-path function pointers and
 // Compute()/begin_compute()/cleanup paths are format-agnostic.
 class InferenceState {
   // Passkey tag for the public constructor below: external callers cannot
@@ -73,6 +73,7 @@ public:
   // Graph outputs are allocated in-graph via the callback installed by
   // set_output_allocator(); there is no outputs span.
   int compute(span_t *inputs) const;
+  bool device_execution_failed() const;
 
   // Install (allocator != nullptr) or clear (nullptr) the output allocator on
   // the loaded artifact's RuntimeState before compute(). Resolved once in the
@@ -136,6 +137,7 @@ private:
   using CleanupFn = int (*)(void *);
   ComputeFn compute_fn_;
   CleanupFn cleanup_fn_;
+  CleanupFn execution_status_fn_;
 
   // Cached so begin_compute() is a single indirect call on the decode hot
   // path. Null when the module does not export the hook.

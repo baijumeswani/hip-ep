@@ -14,7 +14,7 @@
 // CHECK-NEXT:  %[[A_PTR:.*]] = llvm.extractvalue {{.*}}[1] : !llvm.struct<(ptr<1>,
 // CHECK-NEXT:  %[[B_PTR:.*]] = llvm.extractvalue {{.*}}[1] : !llvm.struct<(ptr<1>,
 // CHECK-NEXT:  %[[OUT_PTR:.*]] = llvm.extractvalue {{.*}}[1] : !llvm.struct<(ptr<1>,
-// CHECK-NEXT:  %[[ELEM_SIZE:.*]] = llvm.mlir.constant(2 : i64) : i64
+// CHECK-NEXT:  %[[ELEM_SIZE:.*]] = llvm.mlir.constant(1 : i64) : i64
 // CHECK-NEXT:  llvm.mlir.constant(0 : i64) : i64
 // CHECK-NEXT:  llvm.mlir.constant(0 : i64) : i64
 // CHECK-NEXT:  llvm.call @wrap_hipblasLtMatmul(%[[CTX]], %[[SLOT]], %[[A_PTR]], %[[B_PTR]], %[[OUT_PTR]], %[[M]], %[[N]], %[[K]], %[[BATCH]], %[[ELEM_SIZE]], %[[B_STRIDE]], {{.*}}, {{.*}}) : (!llvm.ptr, i32, !llvm.ptr<1>, !llvm.ptr<1>, !llvm.ptr<1>, i64, i64, i64, i64, i64, i64, i64, i64) -> i32
@@ -50,7 +50,7 @@ func.func @matmul_rank2(
 // CHECK-NEXT:  %[[DYN_A_PTR:.*]] = llvm.extractvalue {{.*}}[1] : !llvm.struct<(ptr<1>,
 // CHECK-NEXT:  %[[DYN_B_PTR:.*]] = llvm.extractvalue {{.*}}[1] : !llvm.struct<(ptr<1>,
 // CHECK-NEXT:  %[[DYN_OUT_PTR:.*]] = llvm.extractvalue {{.*}}[1] : !llvm.struct<(ptr<1>,
-// CHECK-NEXT:  %[[DYN_ELEM_SIZE:.*]] = llvm.mlir.constant(2 : i64) : i64
+// CHECK-NEXT:  %[[DYN_ELEM_SIZE:.*]] = llvm.mlir.constant(1 : i64) : i64
 // CHECK-NEXT:  llvm.mlir.constant(0 : i64) : i64
 // CHECK-NEXT:  llvm.mlir.constant(0 : i64) : i64
 // CHECK-NEXT:  llvm.call @wrap_hipblasLtMatmul(%[[DYN_CTX]], %[[DYN_SLOT]], %[[DYN_A_PTR]], %[[DYN_B_PTR]], %[[DYN_OUT_PTR]], %[[DYN_M]], %[[DYN_N]], %[[DYN_K]], %[[DYN_BATCH]], %[[DYN_ELEM_SIZE]], %[[DYN_B_STRIDE]], {{.*}}, {{.*}}) : (!llvm.ptr, i32, !llvm.ptr<1>, !llvm.ptr<1>, !llvm.ptr<1>, i64, i64, i64, i64, i64, i64, i64, i64) -> i32
@@ -64,5 +64,43 @@ func.func @matmul_dynamic_batch(
       ins(%a, %b : memref<?x128x64xf16, #hipsr.mem<device>>,
                     memref<?x64x32xf16, #hipsr.mem<device>>)
       outs(%init : memref<?x128x32xf16, #hipsr.mem<device>>)
+  return
+}
+
+// CHECK-LABEL: llvm.func @matmul_f32
+// CHECK: llvm.mlir.constant(-1 : i32) : i32
+// CHECK-NEXT: llvm.extractvalue {{.*}}[1]
+// CHECK-NEXT: llvm.extractvalue {{.*}}[1]
+// CHECK-NEXT: llvm.extractvalue {{.*}}[1]
+// CHECK-NEXT: %[[F32:.*]] = llvm.mlir.constant(0 : i64) : i64
+// CHECK: llvm.call @wrap_hipblasLtMatmul({{.*}}, %[[F32]], %{{[^,]+}}, %{{[^,]+}}, %{{[^)]+}})
+func.func @matmul_f32(
+    %ctx: !hipsr.context,
+    %a: memref<2x64xf32, #hipsr.mem<device>>,
+    %b: memref<64x32xf32, #hipsr.mem<device>>,
+    %init: memref<2x32xf32, #hipsr.mem<device>>) {
+  hipsr.matmul(%ctx)
+      ins(%a, %b : memref<2x64xf32, #hipsr.mem<device>>,
+                    memref<64x32xf32, #hipsr.mem<device>>)
+      outs(%init : memref<2x32xf32, #hipsr.mem<device>>)
+  return
+}
+
+// CHECK-LABEL: llvm.func @matmul_bf16
+// CHECK: llvm.mlir.constant(-1 : i32) : i32
+// CHECK-NEXT: llvm.extractvalue {{.*}}[1]
+// CHECK-NEXT: llvm.extractvalue {{.*}}[1]
+// CHECK-NEXT: llvm.extractvalue {{.*}}[1]
+// CHECK-NEXT: %[[BF16:.*]] = llvm.mlir.constant(2 : i64) : i64
+// CHECK: llvm.call @wrap_hipblasLtMatmul({{.*}}, %[[BF16]], %{{[^,]+}}, %{{[^,]+}}, %{{[^)]+}})
+func.func @matmul_bf16(
+    %ctx: !hipsr.context,
+    %a: memref<2x64xbf16, #hipsr.mem<device>>,
+    %b: memref<64x32xbf16, #hipsr.mem<device>>,
+    %init: memref<2x32xbf16, #hipsr.mem<device>>) {
+  hipsr.matmul(%ctx)
+      ins(%a, %b : memref<2x64xbf16, #hipsr.mem<device>>,
+                    memref<64x32xbf16, #hipsr.mem<device>>)
+      outs(%init : memref<2x32xbf16, #hipsr.mem<device>>)
   return
 }

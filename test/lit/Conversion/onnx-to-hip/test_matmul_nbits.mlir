@@ -64,4 +64,20 @@ module {
   // CHECK-SAME: zero_points(%{{.*}} : tensor<5120x90xui8>)
   // CHECK-SAME: outs(%{{.*}} : tensor<1x128x5120xf16>)
   // CHECK-NOT: onnx.Custom
+
+  func.func @test_matmul_nbits_bf16(%a: tensor<8x128xbf16>,
+                                   %b: tensor<64x4x16xui8>,
+                                   %scales: tensor<64x4xbf16>) -> tensor<8x64xbf16> {
+    %y = "onnx.Custom"(%a, %b, %scales) {
+      function_name = "MatMulNBits", domain_name = "com.microsoft",
+      K = 128 : si64, N = 64 : si64, bits = 4 : si64, block_size = 32 : si64
+    } : (tensor<8x128xbf16>, tensor<64x4x16xui8>, tensor<64x4xbf16>) -> tensor<8x64xbf16>
+    return %y : tensor<8x64xbf16>
+  }
+
+  // CHECK-LABEL: func.func @test_matmul_nbits_bf16
+  // CHECK: hip.matmul_nbits
+  // CHECK-SAME: tensor<8x128xbf16>, tensor<64x4x16xui8>, tensor<64x4xbf16>
+  // CHECK-SAME: scale_data_type = 2
+  // CHECK-NOT: onnx.Custom
 }

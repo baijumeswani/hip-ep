@@ -16,6 +16,8 @@ struct RopeOpLowering : public ConvertOpToLLVMPattern<RopeOp> {
   LogicalResult
   matchAndRewrite(RopeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (cast<MemRefType>(op.getInput().getType()).getElementType().isBF16())
+      return op.emitOpError("BF16 standalone RoPE is not supported");
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
     Type ptrType = getPtrType();

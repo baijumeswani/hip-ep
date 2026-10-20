@@ -272,6 +272,7 @@ bool CompilerDriver::compileImpl(mlir::ModuleOp module,
         hipdnn::abi::kInferenceGetMetadataJson,
         "test_hip_from_dll",
         hipdnn::abi::kRuntimeBeginCompute,
+        hipdnn::abi::kRuntimeExecutionStatus,
         hipdnn::abi::kSetOutputAllocator,
         hipdnn::abi::kRuntimeFlushOpProfile,
         "hipdnn_ep_runtime_add_cpu_profile"};

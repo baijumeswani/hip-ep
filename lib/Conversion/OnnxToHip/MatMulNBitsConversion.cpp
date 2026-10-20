@@ -113,32 +113,48 @@ MatMulNBitsToHip::matchAndRewrite(mlir::Operation *op,
   }
   auto zpElemSizeAttr = rewriter.getI64IntegerAttr(zpElemSize);
 
-  // Validate and detect the scales element type. ONNX MatMulNBits allows
-  // scales to match either fp16 or fp32 activation/output dtype (this
-  // model-dependent choice is independent of the packed-weight dtype). The
-  // runtime always dequantizes with fp16 scales internally; a fp32 scales
-  // buffer is cast-and-cached to fp16 on first use (see
-  // lib/Runtime/real/matmul_nbits.cpp). Without this detection, a fp32
-  // scales buffer's raw bytes would be silently misread as fp16, producing
-  // garbage (NaN/Inf) dequantized weights.
-  int64_t scaleElemSize = 2; // default: fp16
+  auto activationType =
+      mlir::cast<mlir::ShapedType>(A.getType()).getElementType();
+  auto outputType =
+      mlir::cast<mlir::ShapedType>(op->getResult(0).getType()).getElementType();
+  if ((!activationType.isF16() && !activationType.isF32() &&
+       !activationType.isBF16()) ||
+      outputType != activationType ||
+      (bias && mlir::cast<mlir::ShapedType>(bias.getType()).getElementType() !=
+                   activationType))
+    return op->emitError("MatMulNBits requires matching f16, bf16 or f32 "
+                         "activations, bias and output");
+  if (activationType.isBF16() &&
+      (bitsAttr.getInt() != 4 || blockSizeAttr.getInt() != 32 || zeroPoints ||
+       gIdx))
+    return op->emitError(
+        "BF16 MatMulNBits requires raw symmetric INT4/block-32 "
+        "without zero_points or g_idx");
+
+  int64_t scaleDataType;
   {
     auto scalesTy = mlir::cast<mlir::ShapedType>(scales.getType());
     mlir::Type scalesElemTy = scalesTy.getElementType();
     if (scalesElemTy.isF16()) {
-      scaleElemSize = 2;
+      scaleDataType = HIPDNN_EP_DATATYPE_HALF;
     } else if (scalesElemTy.isF32()) {
-      scaleElemSize = 4;
+      scaleDataType = HIPDNN_EP_DATATYPE_FLOAT;
+    } else if (scalesElemTy.isBF16()) {
+      if (activationType.isF16() || bitsAttr.getInt() != 4 ||
+          blockSizeAttr.getInt() != 32 || zeroPoints || gIdx)
+        return op->emitError("BF16 scales require BF16 or FP32 raw symmetric "
+                             "INT4/block-32");
+      scaleDataType = HIPDNN_EP_DATATYPE_BFLOAT16;
     } else {
       std::string msg;
       llvm::raw_string_ostream os(msg);
       os << "MatMulNBits: unsupported scales element type: ";
       scalesElemTy.print(os);
-      os << ". Expected f16 or f32";
+      os << ". Expected f16, bf16 or f32";
       return rewriter.notifyMatchFailure(op, msg);
     }
   }
-  auto scaleElemSizeAttr = rewriter.getI64IntegerAttr(scaleElemSize);
+  auto scaleDataTypeAttr = rewriter.getI64IntegerAttr(scaleDataType);
 
   auto rt = mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType());
   mlir::Value init = createEmptyTensor(rewriter, loc, rt, A);
@@ -148,7 +164,7 @@ MatMulNBitsToHip::matchAndRewrite(mlir::Operation *op,
   auto hipOp = mlir::hip::MatMulNBitsOp::create(
       rewriter, loc, context, A, B, scales, zeroPoints, gIdx, bias, init, KAttr,
       NAttr, bitsAttr, blockSizeAttr, accuracyLevelAttr, zpElemSizeAttr,
-      scaleElemSizeAttr);
+      scaleDataTypeAttr);
   rewriter.replaceOp(op, hipOp->getResults());
   return mlir::success();
 }

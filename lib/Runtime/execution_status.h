@@ -23,6 +23,7 @@ public:
   ~ExecutionStatusGuard() {
     if (!state_ || status_ == 0)
       return;
+    hipdnn_ep_state_record_execution_status(state_, status_);
     auto stream = static_cast<hipStream_t>(hipdnn_ep_state_get_stream(state_));
     auto error = hipdnn_ep_state_get_error_flag_device_ptr(state_);
     if (!stream || !error ||

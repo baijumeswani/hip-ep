@@ -1,9 +1,9 @@
 // Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // Licensed under the MIT License.
 
-// RUN: %if ring-gqa %{ hip-mlir-opt --split-input-file --assign-op-state-slots --convert-hip-to-llvm %s | FileCheck %s --check-prefixes=CHECK,RING %} %else %{ hip-mlir-opt --split-input-file --assign-op-state-slots --convert-hip-to-llvm %s | FileCheck %s --check-prefixes=CHECK,DEFAULT %}
-// Ring is opt-in per proven-FP16 operation. All other calls retain GQA;
-// this does not assert that upstream implements BF16 or softcap correctly.
+// RUN: %if ring-gqa %{ hip-mlir-opt --split-input-file --verify-diagnostics --assign-op-state-slots --convert-hip-to-llvm %s | FileCheck %s --check-prefixes=CHECK,RING %} %else %{ hip-mlir-opt --split-input-file --verify-diagnostics --assign-op-state-slots --convert-hip-to-llvm %s | FileCheck %s --check-prefixes=CHECK,DEFAULT %}
+// Ring is opt-in per proven-FP16 operation. Unsupported BF16 storage is
+// rejected rather than passed to an FP16 fallback.
 
 module {
   func.func @ring_f16(%ctx: !hip.context,
@@ -108,6 +108,8 @@ module {
                                 %output: memref<1x1x6144xbf16, 1>,
                                 %present_key: memref<1x4x128x256xbf16, 1>,
                                 %present_value: memref<1x4x128x256xbf16, 1>) {
+    // expected-error @+2 {{BF16 GQA is not supported}}
+    // expected-error @+1 {{failed to legalize operation 'hip.gqa'}}
     hip.gqa(%ctx)
         ins(%query, %key, %value, %past_key, %past_value, %seqlens_k, %total_seq_len :
             memref<1x1x6144xbf16, 1>, memref<1x1x1024xbf16, 1>, memref<1x1x1024xbf16, 1>,
@@ -121,9 +123,6 @@ module {
     return
   }
 }
-
-// CHECK-LABEL: llvm.func @bf16_fallback(
-// CHECK: llvm.call @wrap_group_query_attention_host_length(
 
 // -----
 
@@ -170,6 +169,8 @@ module {
                                 %output: memref<1x1x6144xf16, 1>,
                                 %present_key: memref<1x4x128x256xf16, 1>,
                                 %present_value: memref<1x4x128x256xf16, 1>) {
+    // expected-error @+2 {{BF16 GQA is not supported}}
+    // expected-error @+1 {{failed to legalize operation 'hip.gqa'}}
     hip.gqa(%ctx)
         ins(%query, %key, %value, %past_key, %past_value, %seqlens_k, %total_seq_len :
             memref<1x1x6144xf16, 1>, memref<1x1x1024xbf16, 1>, memref<1x1x1024xbf16, 1>,
@@ -183,9 +184,6 @@ module {
     return
   }
 }
-
-// CHECK-LABEL: llvm.func @mixed_key_fallback(
-// CHECK: llvm.call @wrap_group_query_attention_host_length(
 
 // -----
 
@@ -201,6 +199,8 @@ module {
                                 %output: memref<1x1x6144xf16, 1>,
                                 %present_key: memref<1x4x128x256xbf16, 1>,
                                 %present_value: memref<1x4x128x256xbf16, 1>) {
+    // expected-error @+2 {{BF16 GQA is not supported}}
+    // expected-error @+1 {{failed to legalize operation 'hip.gqa'}}
     hip.gqa(%ctx)
         ins(%query, %key, %value, %past_key, %past_value, %seqlens_k, %total_seq_len :
             memref<1x1x6144xf16, 1>, memref<1x1x1024xf16, 1>, memref<1x1x1024xf16, 1>,
@@ -214,9 +214,6 @@ module {
     return
   }
 }
-
-// CHECK-LABEL: llvm.func @mixed_cache_fallback(
-// CHECK: llvm.call @wrap_group_query_attention_host_length(
 
 // -----
 
@@ -232,6 +229,8 @@ module {
                                 %output: memref<1x1x6144xbf16, 1>,
                                 %present_key: memref<1x4x128x256xf16, 1>,
                                 %present_value: memref<1x4x128x256xf16, 1>) {
+    // expected-error @+2 {{BF16 GQA is not supported}}
+    // expected-error @+1 {{failed to legalize operation 'hip.gqa'}}
     hip.gqa(%ctx)
         ins(%query, %key, %value, %past_key, %past_value, %seqlens_k, %total_seq_len :
             memref<1x1x6144xf16, 1>, memref<1x1x1024xf16, 1>, memref<1x1x1024xf16, 1>,
@@ -245,9 +244,6 @@ module {
     return
   }
 }
-
-// CHECK-LABEL: llvm.func @mixed_output_fallback(
-// CHECK: llvm.call @wrap_group_query_attention_host_length(
 
 // -----
 

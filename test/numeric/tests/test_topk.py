@@ -65,6 +65,57 @@ def _distinct_rows(rng, rows: int, cols: int) -> np.ndarray:
 
 
 class TestTopK:
+    @pytest.mark.parametrize("largest", [0, 1])
+    @pytest.mark.parametrize("sorted_", [0, 1])
+    @pytest.mark.parametrize("shape,k", [([7, 248320], 16), ([2, 3, 513], 32)])
+    def test_wide_last_axis(self, model_runner, largest, sorted_, shape, k):
+        model = _make_topk_model(shape, k, axis=-1, largest=largest, sorted_=sorted_)
+        rng = np.random.default_rng(942)
+        values = rng.integers(-100, 101, shape).astype(np.float32)
+        values[..., 0] = -np.inf
+        values[..., -1] = np.inf
+        actual, expected = model_runner.run_sample(model, [values], reference="cpu")
+        if not sorted_:
+            np.testing.assert_array_equal(
+                np.sort(actual[1], axis=-1), np.sort(expected[1], axis=-1)
+            )
+            np.testing.assert_array_equal(
+                actual[0], np.take_along_axis(values, actual[1], axis=-1)
+            )
+            return
+        for output, reference in zip(actual, expected):
+            np.testing.assert_array_equal(output, reference)
+
+    @pytest.mark.parametrize("largest", [0, 1])
+    def test_wide_equal_values_prefer_lower_indices(self, model_runner, largest):
+        model = _make_topk_model([3, 257], 16, axis=1, largest=largest, sorted_=1)
+        values = np.zeros((3, 257), dtype=np.float32)
+        values[0, ::2] = -0.0
+        values[1] = -np.inf
+        values[2] = np.inf
+        actual, expected = model_runner.run_sample(model, [values], reference="cpu")
+        np.testing.assert_array_equal(actual[1], np.tile(np.arange(16), (3, 1)))
+        for output, reference in zip(actual, expected):
+            np.testing.assert_array_equal(output, reference)
+        np.testing.assert_array_equal(
+            actual[0].view(np.uint32), expected[0].view(np.uint32)
+        )
+
+    @pytest.mark.parametrize("largest", [0, 1])
+    def test_non_last_axis(self, model_runner, largest):
+        model = _make_topk_model([3, 4, 9], 3, axis=1, largest=largest, sorted_=1)
+        values = np.random.default_rng(942).normal(size=(3, 4, 9)).astype(np.float32)
+        actual, expected = model_runner.run_sample(model, [values], reference="cpu")
+        for output, reference in zip(actual, expected):
+            np.testing.assert_array_equal(output, reference)
+
+    def test_irregular_large_selection(self, model_runner):
+        model = _make_topk_model([2, 300], 257, axis=1, largest=1, sorted_=1)
+        values = np.random.default_rng(942).normal(size=(2, 300)).astype(np.float32)
+        actual, expected = model_runner.run_sample(model, [values], reference="cpu")
+        for output, reference in zip(actual, expected):
+            np.testing.assert_array_equal(output, reference)
+
     @pytest.mark.parametrize("largest", [1, 0])
     @pytest.mark.parametrize("sorted_", [1])
     def test_topk_axis1(self, model_runner, largest, sorted_):

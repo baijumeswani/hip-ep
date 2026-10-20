@@ -149,5 +149,5 @@ extern "C" int hip_tile(void *stream, const void *input, void *output,
     fprintf(stderr, "[custom_kernels] hip_tile launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }

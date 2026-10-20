@@ -24,6 +24,7 @@ struct FakeDevice {
   std::vector<std::string> calls;
   bool pending{};
   int failures{};
+  int recorded_status{};
 } device;
 
 #define CHECK(condition)                                                       \
@@ -189,6 +190,13 @@ void test_execution_failure_and_retry() {
     CHECK(status.Finish(-7) == -7);
   }
   CHECK(error != 0);
+  CHECK(device.recorded_status == -7);
+  {
+    ExecutionStatusGuard status(&state);
+    CHECK(status.Finish(HIPDNN_EP_ERR_DEVICE_EXECUTION_FAILED) ==
+          HIPDNN_EP_ERR_DEVICE_EXECUTION_FAILED);
+  }
+  CHECK(device.recorded_status == HIPDNN_EP_ERR_DEVICE_EXECUTION_FAILED);
   release(state);
 }
 
@@ -220,6 +228,11 @@ extern "C" void *hipdnn_ep_state_get_stream(RuntimeState *state) {
 extern "C" void *
 hipdnn_ep_state_get_error_flag_device_ptr(RuntimeState *state) {
   return state->device_error_flag;
+}
+
+extern "C" void hipdnn_ep_state_record_execution_status(RuntimeState *,
+                                                        int status) {
+  device.recorded_status = status;
 }
 
 extern "C" hipError_t hipMemsetAsync(void *output, int value, size_t size,

@@ -904,7 +904,7 @@ def Hip_MatMulNBitsOp : Hip_DpsOp_WithInfer<"matmul_nbits", "Output", [AttrSized
     I64Attr:$block_size,
     I64Attr:$accuracy_level,
     I64Attr:$zp_elem_size,  // zero_points element size: 1=uint8 packed, 2=fp16
-    DefaultValuedAttr<I64Attr, "2">:$scale_elem_size // scales element size in bytes: 2=fp16, 4=fp32
+    DefaultValuedAttr<I64Attr, "1">:$scale_data_type // HIPDNN_EP_DATATYPE_*: FLOAT=0, HALF=1, BFLOAT16=2
   );
 
   let assemblyFormat = [{
@@ -4129,6 +4129,48 @@ def Hip_VarlenGatedDeltaNetOp : Hip_DpsOp_AutoReify<"varlen_gated_delta_net"> {
   );
 }
 
+def Hip_VarlenCausalConvUpdatesOp : Hip_DpsOp_AutoReify<"varlen_causal_conv_updates"> {
+  let summary = "Packed causal convolution with compact prefix values";
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$input,
+    Hip_TensorOrMemRef:$weight,
+    Hip_TensorOrMemRef:$cumulative_lengths,
+    Hip_TensorOrMemRef:$bias,
+    Hip_TensorOrMemRef:$past_state,
+    Hip_TensorOrMemRef:$capture_count,
+    Hip_TensorOrMemRef:$output,
+    Hip_TensorOrMemRef:$present_state,
+    Hip_TensorOrMemRef:$state_updates,
+    I64Attr:$state_update_capacity
+  );
+}
+
+def Hip_VarlenGatedDeltaNetUpdatesOp : Hip_DpsOp_AutoReify<"varlen_gated_delta_net_updates"> {
+  let summary = "Packed Qwen recurrence with compact decay/key/delta prefixes";
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$query,
+    Hip_TensorOrMemRef:$key,
+    Hip_TensorOrMemRef:$value,
+    Hip_TensorOrMemRef:$cumulative_lengths,
+    Hip_TensorOrMemRef:$decay,
+    Hip_TensorOrMemRef:$beta,
+    Hip_TensorOrMemRef:$past_state,
+    Hip_TensorOrMemRef:$a_log,
+    Hip_TensorOrMemRef:$dt_bias,
+    Hip_TensorOrMemRef:$capture_count,
+    Hip_TensorOrMemRef:$state_update_active,
+    Hip_TensorOrMemRef:$output,
+    Hip_TensorOrMemRef:$present_state,
+    Hip_TensorOrMemRef:$state_updates,
+    I64Attr:$key_heads,
+    I64Attr:$value_heads,
+    I64Attr:$state_update_capacity,
+    F32Attr:$scale
+  );
+}
+
 def Hip_HybridGatedRmsNormOp : Hip_DpsOp_AutoReify<"hybrid_gated_rms_norm"> {
   let summary = "FP16/FP32 per-head RMS normalization with an FP32 SiLU gate";
   let arguments = (ins
@@ -4205,6 +4247,58 @@ def Hip_PagedAttentionSeparateOp : Hip_DpsOp_AutoReify<"paged_attention_separate
     I64Attr:$num_heads,
     I64Attr:$kv_num_heads,
     F32Attr:$scale
+  );
+}
+
+def Hip_PagedAttentionBf16Op : Hip_DpsOp_AutoReify<"paged_attention_bf16"> {
+  let summary = "Native BF16 head-128 windowed noncausal attention with QK RMS and RoPE";
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$query,
+    Hip_TensorOrMemRef:$past_key,
+    Hip_TensorOrMemRef:$past_value,
+    Hip_TensorOrMemRef:$cumulative_lengths,
+    Hip_TensorOrMemRef:$past_lengths,
+    Hip_TensorOrMemRef:$block_table,
+    Hip_TensorOrMemRef:$cos_cache,
+    Hip_TensorOrMemRef:$sin_cache,
+    Hip_TensorOrMemRef:$q_norm_weight,
+    Hip_TensorOrMemRef:$k_norm_weight,
+    Hip_TensorOrMemRef:$output,
+    Hip_TensorOrMemRef:$present_key,
+    Hip_TensorOrMemRef:$present_value,
+    I64Attr:$num_heads,
+    I64Attr:$kv_num_heads,
+    I64Attr:$local_window_size,
+    F32Attr:$scale,
+    F32Attr:$qk_norm_epsilon
+  );
+}
+
+def Hip_PagedAttentionBf16SeparateOp : Hip_DpsOp_AutoReify<"paged_attention_bf16_separate"> {
+  let summary = "Separate BF16 Q/K/V windowed attention with fused QK RMS and RoPE";
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$query,
+    Hip_TensorOrMemRef:$key,
+    Hip_TensorOrMemRef:$value,
+    Hip_TensorOrMemRef:$past_key,
+    Hip_TensorOrMemRef:$past_value,
+    Hip_TensorOrMemRef:$cumulative_lengths,
+    Hip_TensorOrMemRef:$past_lengths,
+    Hip_TensorOrMemRef:$block_table,
+    Hip_TensorOrMemRef:$cos_cache,
+    Hip_TensorOrMemRef:$sin_cache,
+    Hip_TensorOrMemRef:$q_norm_weight,
+    Hip_TensorOrMemRef:$k_norm_weight,
+    Hip_TensorOrMemRef:$output,
+    Hip_TensorOrMemRef:$present_key,
+    Hip_TensorOrMemRef:$present_value,
+    I64Attr:$num_heads,
+    I64Attr:$kv_num_heads,
+    I64Attr:$local_window_size,
+    F32Attr:$scale,
+    F32Attr:$qk_norm_epsilon
   );
 }
 

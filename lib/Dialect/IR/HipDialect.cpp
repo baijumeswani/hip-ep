@@ -3733,6 +3733,26 @@ MutableOperandRange PagedAttentionInt8Op::getDpsInitsMutable() {
   return MutableOperandRange(*this, 11, 3);
 }
 
+MutableOperandRange PagedAttentionBf16Op::getDpsInitsMutable() {
+  return MutableOperandRange(*this, 11, 3);
+}
+
+void PagedAttentionBf16Op::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+MutableOperandRange PagedAttentionBf16SeparateOp::getDpsInitsMutable() {
+  return MutableOperandRange(*this, 13, 3);
+}
+
+void PagedAttentionBf16SeparateOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
 void PagedAttentionInt8Op::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
@@ -3757,6 +3777,26 @@ void VarlenCausalConvOp::getEffects(
 
 MutableOperandRange VarlenGatedDeltaNetOp::getDpsInitsMutable() {
   return MutableOperandRange(*this, 10, 2);
+}
+
+MutableOperandRange VarlenCausalConvUpdatesOp::getDpsInitsMutable() {
+  return MutableOperandRange(*this, 7, 3);
+}
+
+void VarlenCausalConvUpdatesOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+MutableOperandRange VarlenGatedDeltaNetUpdatesOp::getDpsInitsMutable() {
+  return MutableOperandRange(*this, 12, 3);
+}
+
+void VarlenGatedDeltaNetUpdatesOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
 }
 
 void VarlenGatedDeltaNetOp::getEffects(

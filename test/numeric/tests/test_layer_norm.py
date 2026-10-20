@@ -15,12 +15,19 @@ These ops are used in Llama-3.1-8B / Qwen / GPT-OSS:
   runtime implements a block-per-row HIP kernel with fp32 internal math.
 """
 
+import json
+import subprocess
+import sys
+from pathlib import Path
+
 import numpy as np
+import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from framework.comparator import compare_outputs
 from framework.onnx_utils import make_model_from_nodes
+from framework.ort_ep_backend import _parse_ep_options
 
 SEQ_LENS = [1, 128]
 HIDDEN = 4096
@@ -34,6 +41,175 @@ _TENSOR_PROTO = {
     np.float16: TensorProto.FLOAT16,
     np.float32: TensorProto.FLOAT,
 }
+
+
+@pytest.mark.parametrize("operation", ["LayerNormalization", "Softmax"])
+def test_bfloat16_untyped_arithmetic_rejected(request, tmp_path, operation):
+    library = request.config.getoption("--ep-dll")
+    if not library:
+        pytest.skip("--ep-dll is required")
+    nodes = [
+        helper.make_node("Cast", ["X"], ["bf_X"], to=TensorProto.BFLOAT16),
+        helper.make_node("Cast", ["scale"], ["bf_scale"], to=TensorProto.BFLOAT16),
+        helper.make_node(
+            operation,
+            ["bf_X", "bf_scale"] if operation == "LayerNormalization" else ["bf_X"],
+            ["bf_Y"],
+            axis=-1,
+        ),
+        helper.make_node("Cast", ["bf_Y"], ["Y"], to=TensorProto.FLOAT),
+    ]
+    model = helper.make_model(
+        helper.make_graph(
+            nodes,
+            "unsupported_bf16_layer_norm",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3]),
+                helper.make_tensor_value_info("scale", TensorProto.FLOAT, [3]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 3])],
+        ),
+        opset_imports=[helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    onnx.checker.check_model(model)
+    path = tmp_path / "unsupported.onnx"
+    onnx.save(model, path)
+    message = f"BF16 {'standalone ' if operation == 'Softmax' else ''}{operation} is not supported"
+    # Strict compilation terminates on unsupported graphs; isolate the
+    # expected rejection so it cannot abort the positive numeric suite.
+    script = """
+import json
+import onnxruntime as ort
+import sys
+provider, library, path, options = sys.argv[1:]
+ort.register_execution_provider_library(provider, library)
+devices = [d for d in ort.get_ep_devices() if d.ep_name == provider]
+assert len(devices) == 1
+config = ort.SessionOptions()
+config.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+config.add_provider_for_devices(devices, json.loads(options))
+ort.InferenceSession(path, sess_options=config)
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            request.config.getoption("--ep-name") + "_bf16_rejected",
+            str(Path(library).resolve()),
+            str(path),
+            json.dumps(_parse_ep_options(request.config.getoption("--ep-option"))),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert message in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("hidden", [33, 5120])
+@pytest.mark.parametrize("skip", [False, True])
+def test_bfloat16_rms_norm(model_runner, hidden, skip):
+    names = ["X", "scale", *(["skip", "bias"] if skip else [])]
+    shapes = {
+        "X": [2, hidden],
+        "scale": [hidden],
+        "skip": [2, hidden],
+        "bias": [hidden],
+    }
+    inputs = [
+        helper.make_tensor_value_info(name, TensorProto.FLOAT, shapes[name])
+        for name in names
+    ]
+
+    def make(reference, with_sum):
+        nodes = []
+        operands = {}
+        for name in names:
+            operand = name + "_bf16"
+            nodes.append(
+                helper.make_node("Cast", [name], [operand], to=TensorProto.BFLOAT16)
+            )
+            if reference:
+                nodes.append(
+                    helper.make_node(
+                        "Cast", [operand], [name + "_fp32"], to=TensorProto.FLOAT
+                    )
+                )
+                operand = name + "_fp32"
+            operands[name] = operand
+        if skip:
+            nodes.append(
+                helper.make_node(
+                    "SkipSimplifiedLayerNormalization",
+                    [operands[name] for name in ("X", "skip", "scale", "bias")],
+                    ["normalized", "", "", "sum"] if with_sum else ["normalized"],
+                    domain="com.microsoft",
+                    epsilon=1e-5,
+                )
+            )
+        else:
+            nodes.append(
+                helper.make_node(
+                    "SimplifiedLayerNormalization",
+                    [operands["X"], operands["scale"]],
+                    ["normalized"],
+                    axis=-1,
+                    epsilon=1e-5,
+                    stash_type=1,
+                )
+            )
+        output_names = ["normalized", *(["sum"] if with_sum else [])]
+        outputs = []
+        for name in output_names:
+            source = name
+            if reference:
+                source = name + "_rounded"
+                nodes.append(
+                    helper.make_node("Cast", [name], [source], to=TensorProto.BFLOAT16)
+                )
+            nodes.append(
+                helper.make_node(
+                    "Cast", [source], [name + "_output"], to=TensorProto.FLOAT
+                )
+            )
+            outputs.append(
+                helper.make_tensor_value_info(
+                    name + "_output", TensorProto.FLOAT, [2, hidden]
+                )
+            )
+        model = make_model_from_nodes(
+            nodes,
+            inputs,
+            outputs,
+            extra_opsets=[helper.make_opsetid("com.microsoft", 1)],
+        )
+        model.ir_version = 10
+        return model
+
+    rng = np.random.default_rng(942)
+    values = [
+        (
+            rng.uniform(-1, 1, shapes[name]) * (131072 if name in ("X", "skip") else 1)
+        ).astype(np.float32)
+        for name in names
+    ]
+    actual, expected = model_runner.run_sample(
+        make(False, skip), values, reference_model=make(True, skip)
+    )
+    compare_outputs(actual[:1], expected[:1], atol=0.03125, rtol=0.008)
+    assert np.all((actual[0].view(np.uint32) & 0xFFFF) == 0)
+    if skip:
+        np.testing.assert_array_equal(actual[1], expected[1])
+        without_sum, _ = model_runner.run_sample(
+            make(False, False),
+            values,
+            reference_model=make(True, False),
+            name=f"bf16_without_sum_{hidden}",
+        )
+        np.testing.assert_array_equal(actual[0], without_sum[0])
 
 
 def _make_simplified_layer_norm_model(

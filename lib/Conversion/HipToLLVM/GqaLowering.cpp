@@ -22,6 +22,11 @@ struct GqaOpLowering : public ConvertOpToLLVMPattern<GqaOp> {
   LogicalResult
   matchAndRewrite(GqaOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (llvm::any_of(op->getOperandTypes(), [](Type type) {
+          auto shaped = dyn_cast<ShapedType>(type);
+          return shaped && shaped.getElementType().isBF16();
+        }))
+      return op.emitOpError("BF16 GQA is not supported");
     const char *callee = kWrapGQAHostLength;
 #if HIP_EP_RING_ENABLED != 0
     // Prove the element types before lowering erases them. A two-byte element

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 
+from ml_dtypes import bfloat16
 import numpy as np
 import onnx
 import onnxruntime as ort
@@ -130,10 +131,10 @@ def test_qwen_w4a16_runtime_error_reaches_caller(w4a16_weights, request):
     "dtype,k,n",
     [
         (dtype, k, n)
-        for dtype in (np.float16, np.float32)
+        for dtype in (np.float16, np.float32, bfloat16)
         for k, n in ((896, 1152), (896, 896), (896, 4864), (4864, 896), (896, 151936))
     ]
-    + [(np.float32, 883, 263)],
+    + [(dtype, 883, 263) for dtype in (np.float32, bfloat16)],
 )
 def test_qwen_w4a16_dynamic_shapes(w4a16_weights, request, tmp_path, dtype, k, n):
     weights, device, provider = w4a16_weights
@@ -148,30 +149,50 @@ def test_qwen_w4a16_dynamic_shapes(w4a16_weights, request, tmp_path, dtype, k, n
         )
     else:
         packed, scales = weights[k, n]
-    if dtype == np.float32:
+    if dtype == bfloat16:
+        scales = numpy_helper.from_array(
+            numpy_helper.to_array(scales).astype(bfloat16), scales.name
+        )
+    elif dtype == np.float32:
         scales = numpy_helper.from_array(
             numpy_helper.to_array(scales).astype(np.float32) * np.float32(1.000123),
             scales.name,
         )
-    activation = helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+    native_bf16 = dtype == bfloat16
+    activation = (
+        TensorProto.FLOAT
+        if native_bf16
+        else helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+    )
     dense = unpack_weight(packed, scales, k, n)
+    initializers = [packed, scales]
+    nodes = []
+    if native_bf16:
+        dense = dense.astype(bfloat16).astype(np.float32)
+        bias = np.random.default_rng(28).uniform(-0.1, 0.1, n).astype(bfloat16)
+        initializers.append(numpy_helper.from_array(bias, "bias"))
+        nodes.append(helper.make_node("Cast", ["X"], ["A"], to=TensorProto.BFLOAT16))
+    nodes.append(
+        helper.make_node(
+            "MatMulNBits",
+            ["A" if native_bf16 else "X", packed.name, scales.name]
+            + (["", "", "bias"] if native_bf16 else []),
+            ["Z" if native_bf16 else "Y"],
+            domain="com.microsoft",
+            K=k,
+            N=n,
+            bits=4,
+            block_size=32,
+        )
+    )
+    if native_bf16:
+        nodes.append(helper.make_node("Cast", ["Z"], ["Y"], to=TensorProto.FLOAT))
     graph = helper.make_graph(
-        [
-            helper.make_node(
-                "MatMulNBits",
-                ["X", packed.name, scales.name],
-                ["Y"],
-                domain="com.microsoft",
-                K=k,
-                N=n,
-                bits=4,
-                block_size=32,
-            )
-        ],
+        nodes,
         "qwen_w4a16",
         [helper.make_tensor_value_info("X", activation, ["rows", k])],
         [helper.make_tensor_value_info("Y", activation, ["rows", n])],
-        initializer=[packed, scales],
+        initializer=initializers,
     )
     model = helper.make_model(
         graph,
@@ -197,14 +218,20 @@ def test_qwen_w4a16_dynamic_shapes(w4a16_weights, request, tmp_path, dtype, k, n
     for rows in (1, 2, 3, 7, 8, 16, 17, 128, 3, 16, 1, 128):
         source = rng.uniform(-1, 1, (rows, k)).astype(dtype)
         expected = source.astype(np.float32) @ dense.T
+        if native_bf16:
+            expected += bias.astype(np.float32)
+            source = source.astype(np.float32)
         actual = session.run(None, {"X": source})[0].astype(np.float32)
         assert np.isfinite(actual).all()
+        if native_bf16:
+            np.testing.assert_array_equal(actual.view(np.uint32) & 0xFFFF, 0)
         difference = actual - expected
         if dtype == np.float32:
             np.testing.assert_allclose(actual, expected, atol=0.00003, rtol=0.00002)
         else:
             np.testing.assert_array_less(
-                np.abs(difference), 0.02 + 0.003 * np.abs(expected)
+                np.abs(difference),
+                0.02 + (0.004 if native_bf16 else 0.003) * np.abs(expected),
             )
         normalized_rms = np.sqrt(np.mean(difference.astype(np.float64) ** 2)) / max(
             np.sqrt(np.mean(expected.astype(np.float64) ** 2)), 1e-12

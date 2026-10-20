@@ -20,6 +20,18 @@ struct MatmulOpLowering : public ConvertOpToLLVMPattern<MatmulOp> {
   LogicalResult
   matchAndRewrite(MatmulOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    auto AType = cast<MemRefType>(op.getA().getType());
+    auto BType = cast<MemRefType>(op.getB().getType());
+    auto elementType = AType.getElementType();
+    if ((!elementType.isF16() && !elementType.isF32() &&
+         !elementType.isBF16() && !elementType.isInteger(32)) ||
+        BType.getElementType() != elementType ||
+        cast<MemRefType>(op.getOutput().getType()).getElementType() !=
+            elementType)
+      return rewriter.notifyMatchFailure(
+          op, "matmul requires matching f16, bf16, f32 or i32 operands");
+    if (elementType.isInteger(32) && (op.getTransA() || op.getTransB()))
+      return op.emitError("hip.matmul of i32 does not support transpose");
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
     Type ptrType = getPtrType();
@@ -40,8 +52,6 @@ struct MatmulOpLowering : public ConvertOpToLLVMPattern<MatmulOp> {
         extractContiguousMemRefPtr(adaptor.getOutput(), rewriter, loc);
 
     // Get memref types and shapes
-    auto AType = cast<MemRefType>(op.getA().getType());
-    auto BType = cast<MemRefType>(op.getB().getType());
     int64_t ARank = AType.getRank();
     int64_t BRank = BType.getRank();
     int64_t transA = op.getTransA();
@@ -74,10 +84,6 @@ struct MatmulOpLowering : public ConvertOpToLLVMPattern<MatmulOp> {
         batchCount = LLVM::MulOp::create(rewriter, loc, batchCount, dim);
       }
     }
-
-    // Compute element size in bytes
-    unsigned elemBits = AType.getElementType().getIntOrFloatBitWidth();
-    Value elemSize = createI64Const(elemBits / 8);
 
     // b_batch_stride: the per-batch stride (in elements) for hipBLASLt's
     // STRIDED_BATCH_OFFSET on layA when batch_count > 1. Two distinct B
@@ -145,8 +151,6 @@ struct MatmulOpLowering : public ConvertOpToLLVMPattern<MatmulOp> {
     // kernel still needs B's batch stride: 0 reuses one matrix, K*N steps
     // to the next. Omitting it made a rank-2 B look batch-contiguous.
     if (AType.getElementType().isInteger(32)) {
-      if (transA || transB)
-        return op.emitError("hip.matmul of i32 does not support transpose");
       SmallVector<Type, 9> i32Params = {ptrType, ptrType, ptrType,
                                         ptrType, i64Type, i64Type,
                                         i64Type, i64Type, i64Type};
@@ -161,11 +165,13 @@ struct MatmulOpLowering : public ConvertOpToLLVMPattern<MatmulOp> {
       return success();
     }
 
+    Value dataType = createI64Const(getHipdnnDataType(elementType));
+
     // Runtime signature:
     // int wrap_hipblasLtMatmul(RuntimeState* state,
     //                          const void* A, const void* B, void* output,
     //                          int64_t M, int64_t N, int64_t K,
-    //                          int64_t batch_count, int64_t elem_size,
+    //                          int64_t batch_count, int64_t data_type,
     //                          int64_t b_batch_stride, int64_t transA,
     //                          int64_t transB, int op_state_slot)
     SmallVector<Type, 13> paramTypes = {
@@ -178,7 +184,7 @@ struct MatmulOpLowering : public ConvertOpToLLVMPattern<MatmulOp> {
         i64Type, // N
         i64Type, // K
         i64Type, // batch_count
-        i64Type, // elem_size
+        i64Type, // data_type
         i64Type, // b_batch_stride
         i64Type, // transA
         i64Type  // transB
@@ -198,7 +204,7 @@ struct MatmulOpLowering : public ConvertOpToLLVMPattern<MatmulOp> {
                                    N,
                                    K,
                                    batchCount,
-                                   elemSize,
+                                   dataType,
                                    bBatchStride,
                                    createI64Const(transA),
                                    createI64Const(transB)};

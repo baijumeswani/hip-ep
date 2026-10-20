@@ -4,6 +4,7 @@
  */
 
 #include "../debug_log.h"
+#include "../execution_status.h"
 #include "../hipdnn_ep_runtime.h"
 #include "../op_profile.h"
 #include "hip_custom_kernels.h"
@@ -190,6 +191,7 @@ int wrap_top_k(RuntimeState *state, void *x, void *k, void *values,
                void *indices, int64_t axis, int64_t largest, int64_t sorted,
                int64_t rank, const int64_t *x_shape, int64_t num_elements,
                int64_t data_type) {
+  ExecutionStatusGuard execution_status(state);
   OP_PROFILE(
       "top_k",
       [&] {
@@ -205,7 +207,7 @@ int wrap_top_k(RuntimeState *state, void *x, void *k, void *values,
   auto finish = [&](int status) {
     if (status != 0)
       hipdnn_ep_state_set_error_flag(state, status);
-    return status;
+    return execution_status.Finish(status);
   };
 
   if (!state || !x || !k || !values || !indices || !x_shape) {

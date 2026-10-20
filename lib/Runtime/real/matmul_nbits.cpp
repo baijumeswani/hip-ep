@@ -343,7 +343,9 @@ uint64_t prefill_shape_key(int64_t M, int64_t N, int64_t K) {
 int matmul_nbits_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
                            const void *A, const void *weights, const void *bias,
                            void *Y, int64_t M, int64_t N, int64_t K,
-                           int64_t element_size = 2, int64_t output_ld = 0) {
+                           int64_t data_type = HIPDNN_EP_DATATYPE_HALF,
+                           int64_t output_ld = 0) {
+  const int64_t element_size = hipdnn_ep_datatype_size(data_type);
   if (output_ld == 0)
     output_ld = N;
   hipblasLtHandle_t handle =
@@ -361,7 +363,10 @@ int matmul_nbits_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
   hipblasLtMatmulDesc_t desc = nullptr;
   hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
   hipblasLtEpilogue_t epi = HIPBLASLT_EPILOGUE_BIAS;
-  hipDataType bias_dtype = element_size == 4 ? HIP_R_32F : HIP_R_16F;
+  hipDataType bias_dtype = data_type == HIPDNN_EP_DATATYPE_FLOAT ? HIP_R_32F
+                           : data_type == HIPDNN_EP_DATATYPE_BFLOAT16
+                               ? HIP_R_16BF
+                               : HIP_R_16F;
   float alpha = 1.0f, beta = 0.0f;
   void *ws = nullptr;
   size_t ws_size = 0;
@@ -538,9 +543,17 @@ int matmul_nbits_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
     ws_size = hipdnn_ep_state_get_workspace_size(state);
   }
 
-  HIPBLAS_CHECK(hipblasLtMatmul(
-      handle, desc, &alpha, weights, matA, A, matB, &beta, Y, matD, Y, matD,
-      have_algo ? &chosen.algo : nullptr, ws, ws_size, stream));
+  {
+    const auto status = hipblasLtMatmul(
+        handle, desc, &alpha, weights, matA, A, matB, &beta, Y, matD, Y, matD,
+        have_algo ? &chosen.algo : nullptr, ws, ws_size, stream);
+    if (status != HIPBLAS_STATUS_SUCCESS) {
+      fprintf(stderr, "matmul_nbits: hipBLASLt execution failed: %d\n", status);
+      result = status == HIPBLAS_STATUS_EXECUTION_FAILED
+                   ? HIPDNN_EP_ERR_DEVICE_EXECUTION_FAILED
+                   : -1;
+    }
+  }
 
 cleanup:
   if (matA)
@@ -561,8 +574,8 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
                       const void *zero_points, const void *g_idx,
                       const void *bias, void *output, int64_t M, int64_t N,
                       int64_t K, int64_t batch_count, int64_t bits,
-                      int64_t block_size, int64_t elem_size,
-                      int64_t zp_elem_size, int64_t scale_elem_size) {
+                      int64_t block_size, int64_t data_type,
+                      int64_t zp_elem_size, int64_t scale_data_type) {
   ExecutionStatusGuard execution_status(state);
   OP_PROFILE(
       "matmul_nbits",
@@ -575,6 +588,31 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
       state);
   if (!state || !A || !B || !scales || !output) {
     fprintf(stderr, "wrap_matmul_nbits: null argument\n");
+    return -1;
+  }
+  const auto supported_type = [](int64_t type) {
+    return type == HIPDNN_EP_DATATYPE_FLOAT ||
+           type == HIPDNN_EP_DATATYPE_HALF ||
+           type == HIPDNN_EP_DATATYPE_BFLOAT16;
+  };
+  if (!supported_type(data_type) || !supported_type(scale_data_type) ||
+      (data_type == HIPDNN_EP_DATATYPE_HALF &&
+       scale_data_type == HIPDNN_EP_DATATYPE_BFLOAT16)) {
+    fprintf(stderr, "matmul_nbits: unsupported activation/scales dtype\n");
+    return -1;
+  }
+  const int64_t elem_size = hipdnn_ep_datatype_size(data_type);
+  const int64_t scale_elem_size = hipdnn_ep_datatype_size(scale_data_type);
+  const auto kernel_dtype = [](int64_t type) {
+    return type == HIPDNN_EP_DATATYPE_FLOAT  ? HIP_DTYPE_FLOAT32
+           : type == HIPDNN_EP_DATATYPE_HALF ? HIP_DTYPE_FLOAT16
+                                             : HIP_DTYPE_BFLOAT16;
+  };
+  if ((data_type == HIPDNN_EP_DATATYPE_BFLOAT16 ||
+       scale_data_type == HIPDNN_EP_DATATYPE_BFLOAT16) &&
+      (bits != 4 || block_size != 32 || zero_points || g_idx)) {
+    fprintf(stderr,
+            "matmul_nbits: BF16 requires raw symmetric INT4/block-32\n");
     return -1;
   }
 
@@ -598,24 +636,25 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
     return -1;
   }
 
-  if (elem_size == 4 && bits == 4 && block_size == 32 && !zero_points) {
+  if ((data_type == HIPDNN_EP_DATATYPE_FLOAT ||
+       data_type == HIPDNN_EP_DATATYPE_BFLOAT16) &&
+      bits == 4 && block_size == 32 && !zero_points) {
     if (M <= 0 || N <= 0 || N > INT_MAX || K <= 0 || K > INT_MAX ||
         batch_count <= 0 || M > INT_MAX / batch_count ||
-        (scale_elem_size != 2 && scale_elem_size != 4) ||
         static_cast<uint64_t>(M * batch_count) >
-            std::numeric_limits<size_t>::max() / sizeof(float) /
+            std::numeric_limits<size_t>::max() / elem_size /
                 static_cast<uint64_t>(std::max(N, K))) {
-      fprintf(stderr, "matmul_nbits: invalid W4A32 geometry or scales\n");
+      fprintf(stderr, "matmul_nbits: invalid typed INT4 geometry or scales\n");
       return -1;
     }
     if (M * batch_count <= 16) {
-      const int status = hip_matmul_nbits_gemv_fp32(
-          stream, static_cast<const float *>(A), B, scales,
-          static_cast<const float *>(bias), static_cast<float *>(output),
-          static_cast<int>(M * batch_count), static_cast<int>(N),
-          static_cast<int>(K), static_cast<int>(scale_elem_size));
+      const int status = hip_matmul_nbits_gemv_typed(
+          stream, A, B, scales, bias, output, static_cast<int>(M * batch_count),
+          static_cast<int>(N), static_cast<int>(K), kernel_dtype(data_type),
+          kernel_dtype(scale_data_type));
       if (status != 0)
-        fprintf(stderr, "matmul_nbits: W4A32 fused GEMV failed: %d\n", status);
+        fprintf(stderr, "matmul_nbits: typed INT4 fused GEMV failed: %d\n",
+                status);
       return execution_status.Finish(status);
     }
     auto *mst = MatmulNbitsState::get_op_state(state, op_state_slot);
@@ -626,33 +665,33 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
     }
     constexpr int64_t tile_channels = 16384;
     const auto channels = std::min(N, tile_channels);
-    auto *scratch =
-        static_cast<float *>(hipdnn_ep_state_ensure_matmul_nbits_scratch(
-            state, stream, static_cast<size_t>(channels) * K * sizeof(float)));
+    auto *scratch = hipdnn_ep_state_ensure_matmul_nbits_scratch(
+        state, stream, static_cast<size_t>(channels) * K * elem_size);
     if (!scratch)
       return -1;
     const int64_t groups = (K + 31) / 32;
     for (int64_t start = 0; start < N; start += tile_channels) {
       const int64_t count = std::min(tile_channels, N - start);
-      const int status = hip_matmul_nbits_dequant_b_fp32(
+      const int status = hip_matmul_nbits_dequant_b_typed(
           stream, static_cast<const uint8_t *>(B) + start * groups * 16,
           static_cast<const uint8_t *>(scales) +
               start * groups * scale_elem_size,
           scratch, static_cast<int>(count), static_cast<int>(K),
-          static_cast<int>(scale_elem_size));
+          kernel_dtype(data_type), kernel_dtype(scale_data_type));
       if (status != 0) {
-        fprintf(stderr, "matmul_nbits: W4A32 dequantization failed: %d\n",
+        fprintf(stderr, "matmul_nbits: typed INT4 dequantization failed: %d\n",
                 status);
-        return status;
+        return execution_status.Finish(status);
       }
       const auto *tile_bias =
-          bias ? static_cast<const float *>(bias) + start : nullptr;
-      const int result =
-          matmul_nbits_hipblaslt(mst, state, A, scratch, tile_bias,
-                                 static_cast<float *>(output) + start,
-                                 M * batch_count, count, K, sizeof(float), N);
+          bias ? static_cast<const uint8_t *>(bias) + start * elem_size
+               : nullptr;
+      const int result = matmul_nbits_hipblaslt(
+          mst, state, A, scratch, tile_bias,
+          static_cast<uint8_t *>(output) + start * elem_size, M * batch_count,
+          count, K, data_type, N);
       if (result != 0)
-        return result;
+        return execution_status.Finish(result);
     }
     return execution_status.Finish(0);
   }

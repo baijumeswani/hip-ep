@@ -54,6 +54,7 @@
 // CHECK-NEXT:      %[[COUNTS:.*]] = llvm.addrspacecast %[[COUNTS_PTR]] : !llvm.ptr<1> to !llvm.ptr
 // CHECK-NEXT:      %[[NOPAIR:.*]] = llvm.mlir.constant(0 : i64) : i64
 // CHECK-NEXT:      %{{.*}} = llvm.call @wrap_sparse_attention_indexer(%[[CTX]], %[[QK]], %[[QW]], %[[KW]], %[[COS]], %[[SIN]], %[[NOMASK]], %[[PSL]], %[[PAST]], %[[SEL]], %[[PRESENT]], %[[B]], %[[S]], %[[P]], %[[PR]], %[[N]], %[[D]], %[[R]], %[[X]], %[[BATCHED]], %[[RATIO]], %[[BUDGET]], %[[ELEM]], %[[PB]], %[[MB]], %[[ML]], %[[CB]], %[[SB]], %[[SR]], %[[EPS]], %[[SCALE]], %[[NOIDS]], %[[NOMAP]], %[[ZERO]], %[[ZERO]], %[[ZERO]], %[[COUNTS]], %[[NOPAIR]])
+// CHECK-NEXT:      llvm.call @hipdnn_ep_state_record_execution_status(%[[CTX]],
 // CHECK-NEXT:      llvm.return
 // CHECK-NEXT:    }
 func.func @sai_counts(
@@ -88,6 +89,7 @@ func.func @sai_counts(
 // CHECK-NEXT:      %[[COUNTS:.*]] = llvm.addrspacecast %[[COUNTS_PTR]] : !llvm.ptr<1> to !llvm.ptr
 // CHECK-NEXT:      %[[PAIR:.*]] = llvm.mlir.constant(1 : i64) : i64
 // CHECK-NEXT:      %{{.*}} = llvm.call @wrap_sparse_attention_indexer(%[[CTX]], {{.*}}, %[[COUNTS]], %[[PAIR]])
+// CHECK-NEXT:      llvm.call @hipdnn_ep_state_record_execution_status(%[[CTX]],
 // CHECK-NEXT:      llvm.return
 // CHECK-NEXT:    }
 func.func @sai_pair_format(

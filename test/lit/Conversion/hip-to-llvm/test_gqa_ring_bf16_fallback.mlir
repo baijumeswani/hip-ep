@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // Licensed under the MIT License.
 
-// RUN: hip-mlir-opt --assign-op-state-slots --convert-hip-to-llvm %s | FileCheck %s
+// RUN: not hip-mlir-opt --assign-op-state-slots --convert-hip-to-llvm %s 2>&1 | FileCheck %s
 
 module {
   func.func @test_gqa_lowering(%ctx: !hip.context,
@@ -29,5 +29,4 @@ module {
   }
 }
 
-// CHECK: llvm.call @wrap_group_query_attention_host_length(
-// CHECK-NOT: @wrap_group_query_attention_ring_f16
+// CHECK: BF16 GQA is not supported

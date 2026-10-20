@@ -59,6 +59,15 @@ the MorphiZen EP, jump to
 wrap the example into a local one-liner (shell function, `.bat`,
 Makefile target, ...) to suit their setup.
 
+The source-weight projection tests in `tests/test_matmul_nbits_w4a16.py`
+also require `HIPDNN_W4A16_MODEL` to name a raw block-32 INT4 model.
+For the direct FP32 launcher's aligned/element-aligned input tests, set
+`HIP_CUSTOM_KERNEL_LIBRARY` to the newly built custom-kernel library for
+the executing device (for example, `libcustom_kernels_gfx942.so` on Linux).
+These raw-ABI tests cover independent FP16/FP32 scale storage; compiled
+ONNX MatMulNBits models must keep activations and scales at the same dtype.
+`HIP_RUNTIME_LIBRARY` can override the platform-default HIP runtime library.
+
 ## CLI Options
 
 | Flag | Default | Description |

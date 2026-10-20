@@ -193,7 +193,7 @@ def _make_matmul_nbits_model(
     )
 
     ms_opset = helper.make_opsetid("com.microsoft", 1)
-    return make_model_from_nodes(
+    model = make_model_from_nodes(
         [node],
         [x],
         [y],
@@ -201,9 +201,56 @@ def _make_matmul_nbits_model(
         opset=21,
         extra_opsets=[ms_opset],
     )
+    model.ir_version = 10
+    return model
 
 
 class TestMatMulNBits:
+    @pytest.mark.parametrize(
+        "batch,rows,K,N,with_bias",
+        [
+            (1, 1, 5120, 10240, True),
+            (1, 2, 5120, 5120, False),
+            (1, 3, 65, 35, True),
+            (1, 7, 128, 35, True),
+            (2, 4, 65, 17, False),
+            (1, 9, 128, 35, True),
+            (1, 16, 65, 16387, True),
+            (1, 17, 128, 35, False),
+            (1, 32, 65, 35, True),
+            (1, 33, 65, 16387, True),
+            (1, 512, 65, 16387, False),
+        ],
+    )
+    def test_matmul_nbits_fp32_small_m(
+        self, model_runner, batch, rows, K, N, with_bias
+    ):
+        """Keep FP32 boundaries across fused decode and tiled-GEMM dispatch."""
+        model = _make_matmul_nbits_model(
+            batch, rows, K, N, scale_range=(-0.01, 0.01), fp32=True
+        )
+        rng = np.random.default_rng(73)
+        x = rng.uniform(-1, 1, [batch, rows, K]).astype(np.float32)
+        bias = rng.uniform(-0.1, 0.1, N).astype(np.float32)
+        if with_bias:
+            model.graph.node[0].input.extend(["", "", "bias"])
+            model.graph.initializer.append(numpy_helper.from_array(bias, name="bias"))
+
+        constants = {
+            tensor.name: numpy_helper.to_array(tensor)
+            for tensor in model.graph.initializer
+        }
+        packed = constants["weight_Q4"]
+        codes = np.empty([N, (K + 31) // 32, 32], dtype=np.float32)
+        codes[:, :, ::2] = (packed & 15).astype(np.float32) - 8
+        codes[:, :, 1::2] = (packed >> 4).astype(np.float32) - 8
+        weights = (codes * constants["weight_scales"][:, :, None]).reshape(N, -1)[:, :K]
+        reference = x @ weights.T
+        if with_bias:
+            reference += bias
+        actual, _ = model_runner.run_sample(model, [x])
+        np.testing.assert_allclose(actual[0], reference, atol=3e-5, rtol=3e-5)
+
     @pytest.mark.parametrize(
         "K,N",
         [

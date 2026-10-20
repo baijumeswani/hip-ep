@@ -608,13 +608,23 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
       fprintf(stderr, "matmul_nbits: invalid W4A32 geometry or scales\n");
       return -1;
     }
+    if (M * batch_count <= 16) {
+      const int status = hip_matmul_nbits_gemv_fp32(
+          stream, static_cast<const float *>(A), B, scales,
+          static_cast<const float *>(bias), static_cast<float *>(output),
+          static_cast<int>(M * batch_count), static_cast<int>(N),
+          static_cast<int>(K), static_cast<int>(scale_elem_size));
+      if (status != 0)
+        fprintf(stderr, "matmul_nbits: W4A32 fused GEMV failed: %d\n", status);
+      return execution_status.Finish(status);
+    }
     auto *mst = MatmulNbitsState::get_op_state(state, op_state_slot);
     if (!mst) {
       fprintf(stderr, "matmul_nbits: no state for W4A32 slot %d\n",
               op_state_slot);
       return -1;
     }
-    constexpr int64_t tile_channels = 256;
+    constexpr int64_t tile_channels = 16384;
     const auto channels = std::min(N, tile_channels);
     auto *scratch =
         static_cast<float *>(hipdnn_ep_state_ensure_matmul_nbits_scratch(

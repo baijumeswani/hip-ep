@@ -8,6 +8,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <climits>
 #include <cmath>
 #include <type_traits>
@@ -42,7 +43,8 @@ __global__ void Validate(const int32_t *cumulative, const int32_t *past,
     return;
   }
   const int pages = (length - 1) / page_size + 1;
-  for (int page = threadIdx.x; page < pages; page += blockDim.x) {
+  for (int page = blockIdx.y * blockDim.x + threadIdx.x; page < pages;
+       page += blockDim.x * gridDim.y) {
     const int physical = table[static_cast<int64_t>(request) * columns + page];
     if (physical < 0 || physical >= blocks)
       atomicExch(error, -1);
@@ -491,7 +493,10 @@ extern "C" HIP_KERNEL_API int hip_paged_int8_append(
     return hipErrorInvalidValue;
   const auto hip_stream = static_cast<hipStream_t>(stream);
   (void)hipGetLastError();
-  hipLaunchKernelGGL((Validate<262144>), dim3(batch), dim3(kThreads), 0,
+  const int validation_blocks =
+      (std::min(columns, 262144 / page_size) + kThreads - 1) / kThreads;
+  hipLaunchKernelGGL((Validate<262144>), dim3(batch, validation_blocks),
+                    dim3(kThreads), 0,
                     hip_stream, cumulative, past, table, tokens, batch,
                     columns, blocks, page_size, 262144, error);
   auto status = hipGetLastError();

@@ -25,6 +25,18 @@ module {
   // CHECK: hip.top_k(%[[CTX]]) ins(%[[X]], %[[K]] : tensor<3x4xf32>, tensor<i64>) outs({{.*}}, {{.*}} : tensor<3x2xf32>, tensor<3x2xi64>) {axis = 1 : i64} : tensor<3x2xf32>, tensor<3x2xi64>
   // CHECK-NOT: onnx.TopK
 
+  func.func @topk_smallest_unsorted(
+      %x: tensor<2x513xf32>, %k: tensor<1xi64>) -> (tensor<2x16xf32>, tensor<2x16xi64>) {
+    %values, %indices = "onnx.TopK"(%x, %k) {
+      axis = -1 : si64, largest = 0 : si64, sorted = 0 : si64
+    } : (tensor<2x513xf32>, tensor<1xi64>) -> (tensor<2x16xf32>, tensor<2x16xi64>)
+    return %values, %indices : tensor<2x16xf32>, tensor<2x16xi64>
+  }
+
+  // CHECK-LABEL: func.func @topk_smallest_unsorted
+  // CHECK: hip.top_k
+  // CHECK-SAME: axis = 1 : i64, largest = false, sorted = false
+
   func.func @topk_last_axis_f16(
       %x: tensor<2x5xf16>, %k: tensor<1xi64>) -> (tensor<2x3xf16>, tensor<2x3xi64>) {
     %values, %indices = "onnx.TopK"(%x, %k) {axis = -1 : si64}

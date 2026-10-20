@@ -12,7 +12,8 @@ The Llama-3.1-8B-fixed model uses:
 
 import numpy as np
 import pytest
-from onnx import helper
+from onnx import TensorProto, helper
+from onnxruntime.capi.onnxruntime_pybind11_state import RuntimeException
 
 from framework.comparator import compare_outputs
 from framework.onnx_utils import make_model_from_nodes, np_to_onnx_type
@@ -22,6 +23,68 @@ from framework.onnx_utils import make_model_from_nodes, np_to_onnx_type
 #   * S=128 : moderate prefill / smoke
 SEQ_LENS = [1, 128]
 INTERMEDIATE = 14336
+
+
+@pytest.mark.parametrize("op", ["Add", "Mul"])
+@pytest.mark.parametrize(
+    "lhs_shape,rhs_shape",
+    [
+        ([8, 5120], [8, 5120]),
+        ([1, 8, 17408], [1]),
+        ([2, 8, 32, 128], [2, 1, 32, 1]),
+    ],
+)
+def test_bfloat16_binary(model_runner, op, lhs_shape, rhs_shape):
+    inputs = [
+        helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+        for name, shape in (("X", lhs_shape), ("Y", rhs_shape))
+    ]
+    outputs = [
+        helper.make_tensor_value_info(
+            "Z", TensorProto.FLOAT, list(np.broadcast_shapes(lhs_shape, rhs_shape))
+        )
+    ]
+    casts = [
+        helper.make_node("Cast", ["X"], ["xb"], to=TensorProto.BFLOAT16),
+        helper.make_node("Cast", ["Y"], ["yb"], to=TensorProto.BFLOAT16),
+    ]
+    tail = [helper.make_node("Cast", ["zb"], ["Z"], to=TensorProto.FLOAT)]
+    model = make_model_from_nodes(
+        casts + [helper.make_node(op, ["xb", "yb"], ["zb"])] + tail,
+        inputs,
+        outputs,
+    )
+    reference = make_model_from_nodes(
+        casts
+        + [
+            helper.make_node("Cast", ["xb"], ["xf"], to=TensorProto.FLOAT),
+            helper.make_node("Cast", ["yb"], ["yf"], to=TensorProto.FLOAT),
+            helper.make_node(op, ["xf", "yf"], ["zf"]),
+            helper.make_node("Cast", ["zf"], ["zb"], to=TensorProto.BFLOAT16),
+        ]
+        + tail,
+        inputs,
+        outputs,
+    )
+    rng = np.random.default_rng(942)
+    lhs = rng.uniform(-4, 4, lhs_shape).astype(np.float32)
+    rhs = rng.uniform(-4, 4, rhs_shape).astype(np.float32)
+    lhs.flat[0] = 1e20
+    actual, expected = model_runner.run_sample(
+        model, [lhs, rhs], reference="cpu", reference_model=reference
+    )
+    np.testing.assert_array_equal(actual[0], expected[0])
+
+
+def test_unsupported_binary_reports_execution_failure(model_runner, request):
+    if request.config.getoption("--backend") != "ort_ep" or (
+        "profile=hip" not in request.config.getoption("--ep-option")
+    ):
+        pytest.skip("HIP execution-status contract through the AMDGPU wrapper")
+    model = _make_binary_model("Add", np.float64, [4])
+    values = np.arange(4, dtype=np.float64)
+    with pytest.raises(RuntimeException, match="inference_compute.*failed"):
+        model_runner.run_sample(model, [values, values])
 
 
 def _make_binary_model(op_type: str, dtype, shape: list[int]):

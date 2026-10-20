@@ -25,6 +25,8 @@ struct CausalConvWithStateOpLowering
   LogicalResult
   matchAndRewrite(CausalConvWithStateOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (cast<MemRefType>(op.getInput().getType()).getElementType().isBF16())
+      return op.emitOpError("BF16 CausalConvWithState is not supported");
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
     Type ptrType = getPtrType();

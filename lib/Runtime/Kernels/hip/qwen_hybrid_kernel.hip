@@ -25,22 +25,39 @@ __global__ void ValidateLengths(const int32_t *cu, int tokens, int batch,
     atomicExch(error, -1);
 }
 
-template <typename T>
+__device__ int CaptureCount(const int32_t *counts, int batch, int capacity,
+                           int length) {
+  int count = counts[batch];
+  count = count < 0 ? 0 : count > capacity ? capacity : count;
+  return count > length ? length : count;
+}
+
+template <typename T, bool Capture = false>
 __global__ void CausalConv(
     const T *input, const T *weight, const int32_t *cu,
     const T *bias, const T *past, T *output, T *present,
-    int channels, const int *error) {
+    int channels, const int *error, const int32_t *capture_count,
+    T *updates, int capacity) {
   if (*error)
     return;
   int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= channels)
     return;
   int b = blockIdx.y;
+  int captured = 0;
+  if constexpr (Capture) {
+    captured = CaptureCount(capture_count, b, capacity, cu[b + 1] - cu[b]);
+    for (int t = 0; t < capacity; ++t)
+      updates[(static_cast<int64_t>(b) * capacity + t) * channels + c] = T(0);
+  }
   int64_t offset = (static_cast<int64_t>(b) * channels + c) * 3;
   T history[3] = {past[offset], past[offset + 1], past[offset + 2]};
   for (int t = cu[b]; t < cu[b + 1]; ++t) {
     int64_t index = static_cast<int64_t>(t) * channels + c;
     T current = input[index];
+    if constexpr (Capture)
+      if (t - cu[b] < captured)
+        updates[(static_cast<int64_t>(b) * capacity + t - cu[b]) * channels + c] = current;
     float sum = static_cast<float>(bias[c]);
     for (int j = 0; j < 3; ++j)
       sum += static_cast<float>(history[j]) * static_cast<float>(weight[c * 4 + j]);
@@ -60,13 +77,14 @@ __device__ float WaveSum(float value) {
   return __shfl(value, 0);
 }
 
-template <typename T>
+template <typename T, bool Capture = false>
 __global__ void GatedDelta(
     const T *query, const T *key, const T *value,
     const int32_t *cu, const float *decay, const float *beta,
     const float *past, const float *a_log, const float *dt_bias,
     T *output, float *present, int key_heads, int value_heads,
-    float scale, const int *error) {
+    float scale, const int *error, const int32_t *capture_count,
+    const int32_t *active, float *updates, int capacity) {
   if (*error)
     return;
   const int lane = threadIdx.x % warpSize;
@@ -75,6 +93,28 @@ __global__ void GatedDelta(
     return;
   const int h = blockIdx.y, b = blockIdx.z;
   const int kh = h / (value_heads / key_heads);
+  int captured = 0;
+  float *update_decay = nullptr, *update_key = nullptr, *update_delta = nullptr;
+  if constexpr (Capture) {
+    const int64_t row_width =
+        static_cast<int64_t>(capacity) * (value_heads + key_heads * 128 + value_heads * 128);
+    update_decay = updates + b * row_width;
+    update_key = update_decay + capacity * value_heads;
+    update_delta = update_key + capacity * key_heads * 128;
+    if (*active) {
+      captured = CaptureCount(capture_count, b, capacity, cu[b + 1] - cu[b]);
+    } else {
+      for (int t = 0; t < capacity; ++t) {
+        if (row == 0 && lane == 0)
+          update_decay[t * value_heads + h] = 0;
+        if (row == 0 && h % (value_heads / key_heads) == 0)
+          for (int d = lane; d < 128; d += warpSize)
+            update_key[(t * key_heads + kh) * 128 + d] = 0;
+        if (lane == 0)
+          update_delta[(t * value_heads + h) * 128 + row] = 0;
+      }
+    }
+  }
   const int64_t state_base =
       ((static_cast<int64_t>(b) * value_heads + h) * 128 + row) * 128;
   // Each wave owns one V-major state row, including across aliased updates.
@@ -107,6 +147,18 @@ __global__ void GatedDelta(
     retrieved = WaveSum(retrieved);
     const float delta = (static_cast<float>(value[vbase + row]) - retrieved) /
                         (1.0f + expf(-beta[gate_index]));
+    if constexpr (Capture) {
+      const int step = t - cu[b];
+      if (step < captured) {
+        if (row == 0 && lane == 0)
+          update_decay[step * value_heads + h] = factor;
+        if (row == 0 && h % (value_heads / key_heads) == 0)
+          for (int d = lane, i = 0; d < 128; d += warpSize, ++i)
+            update_key[(step * key_heads + kh) * 128 + d] = k[i];
+        if (lane == 0)
+          update_delta[(step * value_heads + h) * 128 + row] = delta;
+      }
+    }
     float result = 0;
     for (int d = lane, i = 0; d < 128; d += warpSize, ++i) {
       state[i] += k[i] * delta;
@@ -187,16 +239,21 @@ int ValidatePacked(void *stream, const int32_t *cu, int64_t tokens,
                      dim3(kThreads), 0, static_cast<hipStream_t>(stream), cu,
                      static_cast<int>(tokens), static_cast<int>(batch),
                      static_cast<int *>(error));
-  return hipGetLastError();
+  return hipdnn_device_execution_status(hipGetLastError());
 }
 
 } // namespace
 
-extern "C" HIP_KERNEL_API int hip_varlen_causal_conv(
+template <bool Capture>
+int RunCausalConv(
     void *stream, const void *input, const void *weight,
     const int32_t *cumulative, const void *bias, const void *past,
     void *output, void *present, int64_t tokens, int64_t batch,
-    int64_t channels, void *error_flag, int64_t input_dtype) {
+    int64_t channels, void *error_flag, int64_t input_dtype,
+    const int32_t *capture_count, void *updates, int64_t capacity) {
+  if constexpr (Capture)
+    if (!capture_count || !updates || capacity <= 0 || capacity > 7)
+      return hipErrorInvalidValue;
   if (!input || !weight || !bias || !past || !output || !present ||
       channels <= 0 || channels > INT_MAX / 4 ||
       (input_dtype != HIP_DTYPE_FLOAT16 && input_dtype != HIP_DTYPE_FLOAT32))
@@ -206,7 +263,7 @@ extern "C" HIP_KERNEL_API int hip_varlen_causal_conv(
     return status;
   const auto launch = [&](auto *type) {
     using T = std::remove_pointer_t<decltype(type)>;
-    hipLaunchKernelGGL(CausalConv<T>,
+    hipLaunchKernelGGL((CausalConv<T, Capture>),
                      dim3((channels + kThreads - 1) / kThreads, batch),
                      dim3(kThreads), 0, static_cast<hipStream_t>(stream),
                      static_cast<const T *>(input),
@@ -215,22 +272,28 @@ extern "C" HIP_KERNEL_API int hip_varlen_causal_conv(
                      static_cast<const T *>(past),
                      static_cast<T *>(output),
                      static_cast<T *>(present), static_cast<int>(channels),
-                     static_cast<const int *>(error_flag));
+                     static_cast<const int *>(error_flag), capture_count,
+                     static_cast<T *>(updates), static_cast<int>(capacity));
   };
   if (input_dtype == HIP_DTYPE_FLOAT32)
     launch(static_cast<float *>(nullptr));
   else
     launch(static_cast<__half *>(nullptr));
-  return hipGetLastError();
+  return hipdnn_device_execution_status(hipGetLastError());
 }
 
-extern "C" HIP_KERNEL_API int hip_gated_delta_net(
+template <bool Capture>
+int RunGatedDelta(
     void *stream, const void *query, const void *key, const void *value,
     const int32_t *cumulative, const float *decay, const float *beta,
     const float *past, const float *a_log, const float *dt_bias,
     void *output, float *present, int64_t tokens, int64_t batch,
     int64_t key_heads, int64_t value_heads, float scale, void *error_flag,
-    int64_t input_dtype) {
+    int64_t input_dtype, const int32_t *capture_count,
+    const int32_t *active, float *updates, int64_t capacity) {
+  if constexpr (Capture)
+    if (!capture_count || !active || !updates || capacity <= 0 || capacity > 7)
+      return hipErrorInvalidValue;
   if (!query || !key || !value || !decay || !beta || !past || !a_log ||
       !dt_bias || !output || !present || key_heads <= 0 ||
       value_heads < key_heads || value_heads > 65535 ||
@@ -252,7 +315,7 @@ extern "C" HIP_KERNEL_API int hip_gated_delta_net(
     return hipErrorInvalidValue;
   const auto launch = [&](auto *type) {
     using T = std::remove_pointer_t<decltype(type)>;
-    hipLaunchKernelGGL(GatedDelta<T>,
+    hipLaunchKernelGGL((GatedDelta<T, Capture>),
                      dim3(128 / (kThreads / wave_size), value_heads, batch),
                      dim3(kThreads), 0, static_cast<hipStream_t>(stream),
                      static_cast<const T *>(query),
@@ -261,13 +324,62 @@ extern "C" HIP_KERNEL_API int hip_gated_delta_net(
                      beta, past, a_log, dt_bias,
                      static_cast<T *>(output), present,
                      static_cast<int>(key_heads), static_cast<int>(value_heads),
-                     scale, static_cast<const int *>(error_flag));
+                     scale, static_cast<const int *>(error_flag),
+                     capture_count, active, updates, static_cast<int>(capacity));
   };
   if (input_dtype == HIP_DTYPE_FLOAT32)
     launch(static_cast<float *>(nullptr));
   else
     launch(static_cast<__half *>(nullptr));
-  return hipGetLastError();
+  return hipdnn_device_execution_status(hipGetLastError());
+}
+
+extern "C" HIP_KERNEL_API int hip_varlen_causal_conv(
+    void *stream, const void *input, const void *weight,
+    const int32_t *cumulative, const void *bias, const void *past,
+    void *output, void *present, int64_t tokens, int64_t batch,
+    int64_t channels, void *error_flag, int64_t input_dtype) {
+  return RunCausalConv<false>(stream, input, weight, cumulative, bias, past,
+                              output, present, tokens, batch, channels,
+                              error_flag, input_dtype, nullptr, nullptr, 0);
+}
+
+extern "C" HIP_KERNEL_API int hip_varlen_causal_conv_updates(
+    void *stream, const void *input, const void *weight,
+    const int32_t *cumulative, const void *bias, const void *past,
+    const int32_t *capture_count, void *output, void *present, void *updates,
+    int64_t tokens, int64_t batch, int64_t channels, int64_t capacity,
+    void *error_flag, int64_t input_dtype) {
+  return RunCausalConv<true>(stream, input, weight, cumulative, bias, past,
+                             output, present, tokens, batch, channels,
+                             error_flag, input_dtype, capture_count, updates, capacity);
+}
+
+extern "C" HIP_KERNEL_API int hip_gated_delta_net(
+    void *stream, const void *query, const void *key, const void *value,
+    const int32_t *cumulative, const float *decay, const float *beta,
+    const float *past, const float *a_log, const float *dt_bias,
+    void *output, float *present, int64_t tokens, int64_t batch,
+    int64_t key_heads, int64_t value_heads, float scale, void *error_flag,
+    int64_t input_dtype) {
+  return RunGatedDelta<false>(stream, query, key, value, cumulative, decay, beta,
+                              past, a_log, dt_bias, output, present, tokens, batch,
+                              key_heads, value_heads, scale, error_flag, input_dtype,
+                              nullptr, nullptr, nullptr, 0);
+}
+
+extern "C" HIP_KERNEL_API int hip_gated_delta_net_updates(
+    void *stream, const void *query, const void *key, const void *value,
+    const int32_t *cumulative, const float *decay, const float *beta,
+    const float *past, const float *a_log, const float *dt_bias,
+    const int32_t *capture_count, const int32_t *active,
+    void *output, float *present, float *updates, int64_t tokens, int64_t batch,
+    int64_t key_heads, int64_t value_heads, int64_t capacity, float scale,
+    void *error_flag, int64_t input_dtype) {
+  return RunGatedDelta<true>(stream, query, key, value, cumulative, decay, beta,
+                             past, a_log, dt_bias, output, present, tokens, batch,
+                             key_heads, value_heads, scale, error_flag, input_dtype,
+                             capture_count, active, updates, capacity);
 }
 
 extern "C" HIP_KERNEL_API int hip_gated_rms_norm(
@@ -294,7 +406,7 @@ extern "C" HIP_KERNEL_API int hip_gated_rms_norm(
     launch(static_cast<float *>(nullptr));
   else
     launch(static_cast<__half *>(nullptr));
-  return hipGetLastError();
+  return hipdnn_device_execution_status(hipGetLastError());
 }
 
 extern "C" HIP_KERNEL_API int hip_mrotary_embedding_fp32(
@@ -320,5 +432,5 @@ extern "C" HIP_KERNEL_API int hip_mrotary_embedding_fp32(
       dim3(kThreads), 0, hip_stream, input, positions, cos_cache, sin_cache,
       output, static_cast<int>(tokens), static_cast<int>(heads),
       static_cast<const int *>(error_flag));
-  return hipGetLastError();
+  return hipdnn_device_execution_status(hipGetLastError());
 }

@@ -41,6 +41,65 @@ def _make_matmul_model(input_shape: list[int], weight_shape: list[int]):
 
 
 class TestMatMul:
+    @pytest.mark.parametrize("batch,rows", [(1, 1), (2, 8)])
+    def test_bfloat16_matmul(self, model_runner, batch, rows):
+        shape = [batch, rows, 128]
+        weight_shape = [1, 128, 64]
+        inputs = [
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, shape),
+            helper.make_tensor_value_info("W", TensorProto.FLOAT, weight_shape),
+        ]
+        outputs = [
+            helper.make_tensor_value_info("Y", TensorProto.FLOAT, [batch, rows, 64])
+        ]
+
+        def make(reference):
+            nodes = []
+            operands = []
+            for name in ("X", "W"):
+                nodes.append(
+                    helper.make_node(
+                        "Cast", [name], [name + "_bf16"], to=TensorProto.BFLOAT16
+                    )
+                )
+                operand = name + "_bf16"
+                if reference:
+                    nodes.append(
+                        helper.make_node(
+                            "Cast", [operand], [name + "_fp32"], to=TensorProto.FLOAT
+                        )
+                    )
+                    operand = name + "_fp32"
+                operands.append(operand)
+            nodes.append(helper.make_node("MatMul", operands, ["product"]))
+            if reference:
+                nodes.append(
+                    helper.make_node(
+                        "Cast", ["product"], ["rounded"], to=TensorProto.BFLOAT16
+                    )
+                )
+            nodes.append(
+                helper.make_node(
+                    "Cast",
+                    ["rounded" if reference else "product"],
+                    ["Y"],
+                    to=TensorProto.FLOAT,
+                )
+            )
+            model = make_model_from_nodes(nodes, inputs, outputs)
+            model.ir_version = 10
+            return model
+
+        rng = np.random.default_rng(942)
+        # BF16's exponent range must not be narrowed through an FP16 adapter.
+        x = (rng.uniform(-1, 1, shape) * 131072).astype(np.float32)
+        weight = (rng.uniform(-1, 1, weight_shape) / 131072).astype(np.float32)
+        actual, expected = model_runner.run_sample(
+            make(False), [x, weight], reference_model=make(True)
+        )
+        compare_outputs(actual, expected, atol=0.0625, rtol=0.008)
+        assert np.all((actual[0].view(np.uint32) & 0xFFFF) == 0)
+
     @pytest.mark.parametrize(
         "input_shape,weight_shape",
         [

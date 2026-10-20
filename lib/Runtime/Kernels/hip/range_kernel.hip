@@ -152,5 +152,5 @@ extern "C" int hip_range(void *stream, const void *start, const void *limit,
     fprintf(stderr, "[custom_kernels] hip_range launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }

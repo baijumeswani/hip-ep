@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -52,6 +53,10 @@ int wrap_paged_attention_int8(
   const auto fail = [&](const char *message) {
     std::fprintf(stderr, "HIP INT8 PagedAttention: %s\n", message);
     return RecordFailure(stream, error);
+  };
+  const auto execute = [state](int status) {
+    hipdnn_ep_state_record_execution_status(state, status);
+    return status;
   };
   if (!query || !key || !value || !past_key || !past_value || !cumulative ||
       !past_lengths || !table || !key_scale || !value_scale || !output ||
@@ -111,7 +116,7 @@ int wrap_paged_attention_int8(
   float *partial = scores + score_elements;
   float *accumulator = partial + query_elements;
   float *statistics = accumulator + query_elements;
-  if (hip_paged_int8_append(
+  if (execute(hip_paged_int8_append(
           stream, static_cast<const float *>(key),
           static_cast<const float *>(value), static_cast<int8_t *>(past_key),
           static_cast<int8_t *>(past_value),
@@ -123,7 +128,7 @@ int wrap_paged_attention_int8(
           static_cast<int>(batch), static_cast<int>(table_columns),
           static_cast<int>(key_blocks), static_cast<int>(key_page_size),
           static_cast<int>(kv_heads), error,
-          static_cast<int>(residual_bits)) != 0)
+          static_cast<int>(residual_bits))) != 0)
     return fail("metadata/scale validation or cache append launch failed");
 
   // Only tiny control vectors cross to the host. Cache and attention tensors
@@ -149,8 +154,11 @@ int wrap_paged_attention_int8(
     std::abort();
   }
   if (cumulative_status != hipSuccess || past_status != hipSuccess ||
-      error_status != hipSuccess)
+      error_status != hipSuccess) {
+    hipdnn_ep_state_record_execution_status(
+        state, HIPDNN_EP_ERR_DEVICE_EXECUTION_FAILED);
     return fail("metadata readback failed");
+  }
   if (execution_error)
     return fail("invalid page metadata or nonpositive/nonfinite cache scales");
 
@@ -167,13 +175,13 @@ int wrap_paged_attention_int8(
                                 static_cast<int64_t>(begin) * heads * 256;
       auto *output_begin = static_cast<float *>(output) +
                            static_cast<int64_t>(begin) * heads * 256;
-      if (hip_paged_int8_pack_query(stream, query_begin, packed_query, queries,
-                                    static_cast<int>(heads),
-                                    static_cast<int>(kv_heads), error) != 0)
+      if (execute(hip_paged_int8_pack_query(
+              stream, query_begin, packed_query, queries,
+              static_cast<int>(heads), static_cast<int>(kv_heads), error)) != 0)
         return fail("query packing failed");
       for (int key_begin = 0; key_begin < total; key_begin += key_tile) {
         const int keys = std::min(key_tile, total - key_begin);
-        if (hip_paged_int8_pack_cache(
+        if (execute(hip_paged_int8_pack_cache(
                 stream, static_cast<const int8_t *>(past_key),
                 static_cast<const int8_t *>(past_value),
                 static_cast<const int32_t *>(table) +
@@ -182,28 +190,152 @@ int wrap_paged_attention_int8(
                 static_cast<const float *>(value_scale), packed_key,
                 packed_value, key_begin, keys, static_cast<int>(key_page_size),
                 static_cast<int>(kv_heads), error,
-                static_cast<int>(residual_bits)) != 0 ||
+                static_cast<int>(residual_bits))) != 0 ||
             wrap_hipblasLtMatmul(state, op_state_slot, packed_query, packed_key,
-                                 scores, rows, keys, 256, kv_heads, 4,
+                                 scores, rows, keys, 256, kv_heads,
+                                 HIPDNN_EP_DATATYPE_FLOAT,
                                  static_cast<int64_t>(keys) * 256, 0, 1) != 0 ||
-            hip_paged_int8_softmax(stream, scores, statistics, queries, keys,
-                                   static_cast<int>(heads),
-                                   static_cast<int>(kv_heads),
-                                   prefix + (begin - start), key_begin,
-                                   scale == 0 ? 0.0625f : scale, error) != 0 ||
+            execute(hip_paged_int8_softmax(
+                stream, scores, statistics, queries, keys,
+                static_cast<int>(heads), static_cast<int>(kv_heads),
+                prefix + (begin - start), key_begin,
+                scale == 0 ? 0.0625f : scale, error)) != 0 ||
             wrap_hipblasLtMatmul(state, op_state_slot, scores, packed_value,
-                                 partial, rows, 256, keys, kv_heads, 4,
+                                 partial, rows, 256, keys, kv_heads,
+                                 HIPDNN_EP_DATATYPE_FLOAT,
                                  static_cast<int64_t>(keys) * 256, 0, 0) != 0 ||
-            hip_paged_int8_merge(stream, partial, accumulator, statistics,
-                                 output_begin, queries, static_cast<int>(heads),
-                                 static_cast<int>(kv_heads), key_begin == 0,
-                                 key_begin + keys == total, error) != 0)
+            execute(hip_paged_int8_merge(
+                stream, partial, accumulator, statistics, output_begin, queries,
+                static_cast<int>(heads), static_cast<int>(kv_heads),
+                key_begin == 0, key_begin + keys == total, error)) != 0)
           return fail("tiled attention execution failed");
       }
       begin += queries;
     }
   }
   return 0;
+}
+
+static int RunPagedAttentionBf16(
+    RuntimeState *state, void *query, void *key, void *value, void *past_key,
+    void *past_value, void *cumulative, void *past_lengths, void *table,
+    void *cos_cache, void *sin_cache, void *q_norm_weight, void *k_norm_weight,
+    void *output, void *present_key, void *present_value, int64_t tokens,
+    int64_t key_tokens, int64_t value_tokens, int64_t output_tokens,
+    int64_t batch, int64_t cumulative_count, int64_t table_rows,
+    int64_t table_columns, int64_t key_blocks, int64_t key_page_size,
+    int64_t value_blocks, int64_t value_page_size, int64_t present_key_blocks,
+    int64_t present_key_page_size, int64_t present_value_blocks,
+    int64_t present_value_page_size, int64_t rotary_length, int64_t sin_length,
+    int64_t heads, int64_t kv_heads, int64_t local_window_size, float scale,
+    float qk_norm_epsilon, bool separate) {
+  if (!state)
+    return -1;
+  auto stream = hipdnn_ep_state_get_stream(state);
+  auto error = hipdnn_ep_state_get_error_flag_device_ptr(state);
+  if (!stream || !error)
+    return -1;
+  const auto fail = [&](const char *message) {
+    std::fprintf(stderr, "HIP BF16 PagedAttention: %s\n", message);
+    return RecordFailure(stream, error);
+  };
+  if (!query ||
+      (separate &&
+       (!key || !value || key_tokens != tokens || value_tokens != tokens)) ||
+      tokens <= 0 || tokens > INT_MAX || output_tokens != tokens ||
+      batch <= 0 || batch > tokens || batch > 65535 ||
+      cumulative_count != batch + 1 || table_rows != batch ||
+      table_columns <= 0 || table_columns > INT_MAX || key_blocks <= 0 ||
+      key_blocks > INT_MAX || key_page_size < 16 || key_page_size > 4096 ||
+      (key_page_size & (key_page_size - 1)) != 0 ||
+      value_blocks != key_blocks || value_page_size != key_page_size ||
+      present_key_blocks != key_blocks || present_value_blocks != key_blocks ||
+      present_key_page_size != key_page_size ||
+      present_value_page_size != key_page_size || past_key != present_key ||
+      past_value != present_value || rotary_length <= 0 ||
+      rotary_length > INT_MAX || sin_length != rotary_length || heads <= 0 ||
+      heads > 65535 || kv_heads <= 0 || kv_heads > heads ||
+      heads + kv_heads > 65535 || heads % kv_heads != 0 ||
+      local_window_size <= 0 || local_window_size > 4096 ||
+      !std::isfinite(scale) || scale < 0 || !std::isfinite(qk_norm_epsilon) ||
+      qk_norm_epsilon <= 0 ||
+      key_blocks > INT64_MAX / (key_page_size * kv_heads * 128 * 2) ||
+      static_cast<uint64_t>(tokens) >
+          std::numeric_limits<size_t>::max() / sizeof(uint16_t) / heads / 128)
+    return fail("invalid geometry, metadata extents or caller-bound aliases");
+  auto *query_scratch = hipdnn_ep_state_ensure_paged_attention_scratch(
+      state, static_cast<size_t>(tokens) * heads * 128 * sizeof(uint16_t));
+  if (!query_scratch)
+    return fail("cannot reserve packed BF16 query workspace");
+  const auto *packed = static_cast<const uint16_t *>(query);
+  const int query_stride =
+      static_cast<int>(separate ? heads : heads + 2 * kv_heads) * 128;
+  const int kv_stride =
+      separate ? static_cast<int>(kv_heads) * 128 : query_stride;
+  const auto status = hip_paged_attention_bf16_strided(
+      stream, query, separate ? key : packed + heads * 128,
+      separate ? value : packed + (heads + kv_heads) * 128, past_key,
+      past_value, static_cast<const int32_t *>(cumulative),
+      static_cast<const int32_t *>(past_lengths),
+      static_cast<const int32_t *>(table), cos_cache, sin_cache, q_norm_weight,
+      k_norm_weight, query_scratch, output, static_cast<int>(tokens),
+      static_cast<int>(batch), static_cast<int>(table_columns),
+      static_cast<int>(key_blocks), static_cast<int>(key_page_size),
+      static_cast<int>(heads), static_cast<int>(kv_heads), query_stride,
+      kv_stride, static_cast<int>(rotary_length),
+      static_cast<int>(local_window_size), scale, qk_norm_epsilon, error);
+  hipdnn_ep_state_record_execution_status(state, status);
+  if (status != 0)
+    return fail("metadata validation, QK normalization/RoPE or attention "
+                "launch failed");
+  return 0;
+}
+
+int wrap_paged_attention_bf16(
+    RuntimeState *state, void *query, void *past_key, void *past_value,
+    void *cumulative, void *past_lengths, void *table, void *cos_cache,
+    void *sin_cache, void *q_norm_weight, void *k_norm_weight, void *output,
+    void *present_key, void *present_value, int64_t tokens,
+    int64_t output_tokens, int64_t batch, int64_t cumulative_count,
+    int64_t table_rows, int64_t table_columns, int64_t key_blocks,
+    int64_t key_page_size, int64_t value_blocks, int64_t value_page_size,
+    int64_t present_key_blocks, int64_t present_key_page_size,
+    int64_t present_value_blocks, int64_t present_value_page_size,
+    int64_t rotary_length, int64_t sin_length, int64_t heads, int64_t kv_heads,
+    int64_t local_window_size, float scale, float qk_norm_epsilon) {
+  return RunPagedAttentionBf16(
+      state, query, nullptr, nullptr, past_key, past_value, cumulative,
+      past_lengths, table, cos_cache, sin_cache, q_norm_weight, k_norm_weight,
+      output, present_key, present_value, tokens, tokens, tokens, output_tokens,
+      batch, cumulative_count, table_rows, table_columns, key_blocks,
+      key_page_size, value_blocks, value_page_size, present_key_blocks,
+      present_key_page_size, present_value_blocks, present_value_page_size,
+      rotary_length, sin_length, heads, kv_heads, local_window_size, scale,
+      qk_norm_epsilon, false);
+}
+
+int wrap_paged_attention_bf16_separate(
+    RuntimeState *state, void *query, void *key, void *value, void *past_key,
+    void *past_value, void *cumulative, void *past_lengths, void *table,
+    void *cos_cache, void *sin_cache, void *q_norm_weight, void *k_norm_weight,
+    void *output, void *present_key, void *present_value, int64_t tokens,
+    int64_t key_tokens, int64_t value_tokens, int64_t output_tokens,
+    int64_t batch, int64_t cumulative_count, int64_t table_rows,
+    int64_t table_columns, int64_t key_blocks, int64_t key_page_size,
+    int64_t value_blocks, int64_t value_page_size, int64_t present_key_blocks,
+    int64_t present_key_page_size, int64_t present_value_blocks,
+    int64_t present_value_page_size, int64_t rotary_length, int64_t sin_length,
+    int64_t heads, int64_t kv_heads, int64_t local_window_size, float scale,
+    float qk_norm_epsilon) {
+  return RunPagedAttentionBf16(
+      state, query, key, value, past_key, past_value, cumulative, past_lengths,
+      table, cos_cache, sin_cache, q_norm_weight, k_norm_weight, output,
+      present_key, present_value, tokens, key_tokens, value_tokens,
+      output_tokens, batch, cumulative_count, table_rows, table_columns,
+      key_blocks, key_page_size, value_blocks, value_page_size,
+      present_key_blocks, present_key_page_size, present_value_blocks,
+      present_value_page_size, rotary_length, sin_length, heads, kv_heads,
+      local_window_size, scale, qk_norm_epsilon, true);
 }
 
 int wrap_paged_attention_separate(
@@ -242,6 +374,7 @@ int wrap_paged_attention_separate(
       static_cast<const int32_t *>(past_lengths),
       static_cast<const int32_t *>(table), output, tokens, batch, table_columns,
       key_blocks, key_page_size, heads, kv_heads, scale, error, input_dtype);
+  hipdnn_ep_state_record_execution_status(state, status);
   if (status != 0) {
     std::fprintf(stderr, "HIP separate PagedAttention failed: %d\n", status);
     return RecordFailure(stream, error);
@@ -282,6 +415,7 @@ int wrap_paged_attention(RuntimeState *state, void *query, void *past_key,
       static_cast<const int32_t *>(block_table), cos_cache, sin_cache, output,
       tokens, batch, table_columns, num_blocks, block_size, num_heads,
       kv_num_heads, rotary_length, scale, error_flag);
+  hipdnn_ep_state_record_execution_status(state, status);
   if (status != 0) {
     std::fprintf(stderr, "HIP FP16 PagedAttention failed: %d\n", status);
     return RecordFailure(stream, error_flag);

@@ -616,9 +616,19 @@ OrtStatus *MorphiZenEP::CompileSubgraph(const morphizen::ExecutionProvider &ep,
            OrtKernelContext *kernel_context) -> OrtStatus * {
       auto self = static_cast<MorphiZenEP_ComputeInfo *>(this_ptr);
       (void)self;
-      static_cast<morphizen::CustomOp *>(compute_state)
-          ->Compute(&Ort::GetApi(), kernel_context);
-      return nullptr;
+      try {
+        static_cast<morphizen::CustomOp *>(compute_state)
+            ->Compute(&Ort::GetApi(), kernel_context);
+        return nullptr;
+      } catch (const Ort::Exception &error) {
+        return Ort::GetApi().CreateStatus(error.GetOrtErrorCode(),
+                                          error.what());
+      } catch (const std::exception &error) {
+        return Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, error.what());
+      } catch (...) {
+        return Ort::GetApi().CreateStatus(
+            ORT_RUNTIME_EXCEPTION, "Unknown compiled execution exception");
+      }
     };
     MY_LOG(2) << "CompileSubgraph: Successfully compiled subgraph";
     return nullptr;

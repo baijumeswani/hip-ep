@@ -3,6 +3,7 @@
  * Licensed under the MIT License.
  */
 #include "../debug_log.h"
+#include "../execution_status.h"
 #include "../hipdnn_ep_runtime.h"
 #include "../op_profile.h"
 #include "hip_custom_kernels.h"
@@ -39,6 +40,7 @@ static int hipdnn_to_hip_dtype(int64_t hipdnn_type) {
 int wrap_cast(RuntimeState *state, void *input, void *output,
               int64_t num_elements, int64_t src_data_type,
               int64_t dst_data_type) {
+  ExecutionStatusGuard execution_status(state);
   OP_PROFILE(
       "cast",
       [&] {
@@ -79,7 +81,7 @@ int wrap_cast(RuntimeState *state, void *input, void *output,
     }
     if (input == output) {
       // Identity in-place: nothing to do.
-      return 0;
+      return execution_status.Finish(0);
     }
     size_t bytes = static_cast<size_t>(num_elements) * elem_size;
     hipError_t err =
@@ -91,14 +93,14 @@ int wrap_cast(RuntimeState *state, void *input, void *output,
               "(n=%lld dtype=%lld)\n",
               hipGetErrorString(err), (long long)num_elements,
               (long long)src_data_type);
-      return -1;
+      return execution_status.Finish(hipdnn_device_execution_status(err));
     }
     RUNTIME_DEBUG_LOG(
         "[REAL] wrap_cast same-dtype D2D copy: n=%lld dtype=%s(%lld) "
         "bytes=%zu\n",
         (long long)num_elements, hipdnn_ep_datatype_name(src_data_type),
         (long long)src_data_type, bytes);
-    return 0;
+    return execution_status.Finish(0);
   }
 
   int src_hip_dtype = hipdnn_to_hip_dtype(src_data_type);
@@ -118,6 +120,6 @@ int wrap_cast(RuntimeState *state, void *input, void *output,
       (long long)src_data_type, hipdnn_ep_datatype_name(dst_data_type),
       (long long)dst_data_type);
 
-  return hip_cast(stream, input, output, num_elements, src_hip_dtype,
-                  dst_hip_dtype);
+  return execution_status.Finish(hip_cast(stream, input, output, num_elements,
+                                          src_hip_dtype, dst_hip_dtype));
 }

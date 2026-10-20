@@ -17,8 +17,8 @@
 // QUANT: INT8 caches require static PER_CHANNEL scales
 // SCALES: INT8 requires separate FP32 Q/K/V and FP32 [kv_heads,1,256] K/V scales
 // UNSIGNED: quantized caches must be signed INT8, not UINT8
-// DTYPE: cache dtype attribute must match FP16 or signed INT8 storage
-// CAUSAL: requires grouped heads, full causal attention
+// DTYPE: cache dtype attribute must match FP16, BF16 or signed INT8 storage
+// CAUSAL: requires grouped heads, supported causal/window policy and supported RoPE layout
 // LAYOUT: requires separate K/V cache storage
 // WIDTH: matching static cache geometry
 // RESIDUAL: residual bits must be 0, or 8 with signed INT8 caches

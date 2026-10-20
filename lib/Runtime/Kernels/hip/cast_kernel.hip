@@ -8,8 +8,18 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 #include <cstdint>
 #include <cstdio>
+
+template <typename Source, typename Destination>
+__global__ void cast_bfloat_kernel(
+    const Source* __restrict__ input,
+    Destination* __restrict__ output, int64_t num_elements) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < num_elements)
+    output[idx] = Destination(static_cast<float>(input[idx]));
+}
 
 __global__ void cast_i64_to_i32_kernel(
     const int64_t* __restrict__ input,
@@ -221,6 +231,26 @@ extern "C" int hip_cast(
                        static_cast<const __half*>(input),
                        static_cast<float*>(output),
                        num_elements);
+  } else if (input_dtype == HIP_DTYPE_FLOAT32 && output_dtype == HIP_DTYPE_BFLOAT16) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(cast_bfloat_kernel<float, __hip_bfloat16>),
+                       dim3(grid_size), dim3(kBlockSize), 0, hip_stream,
+                       static_cast<const float*>(input),
+                       static_cast<__hip_bfloat16*>(output), num_elements);
+  } else if (input_dtype == HIP_DTYPE_BFLOAT16 && output_dtype == HIP_DTYPE_FLOAT32) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(cast_bfloat_kernel<__hip_bfloat16, float>),
+                       dim3(grid_size), dim3(kBlockSize), 0, hip_stream,
+                       static_cast<const __hip_bfloat16*>(input),
+                       static_cast<float*>(output), num_elements);
+  } else if (input_dtype == HIP_DTYPE_FLOAT16 && output_dtype == HIP_DTYPE_BFLOAT16) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(cast_bfloat_kernel<__half, __hip_bfloat16>),
+                       dim3(grid_size), dim3(kBlockSize), 0, hip_stream,
+                       static_cast<const __half*>(input),
+                       static_cast<__hip_bfloat16*>(output), num_elements);
+  } else if (input_dtype == HIP_DTYPE_BFLOAT16 && output_dtype == HIP_DTYPE_FLOAT16) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(cast_bfloat_kernel<__hip_bfloat16, __half>),
+                       dim3(grid_size), dim3(kBlockSize), 0, hip_stream,
+                       static_cast<const __hip_bfloat16*>(input),
+                       static_cast<__half*>(output), num_elements);
   } else if (input_dtype == HIP_DTYPE_INT64 && output_dtype == HIP_DTYPE_FLOAT32) {
     CUSTOM_KERNELS_DEBUG_LOG("[custom_kernels] hip_cast: INT64->FLOAT32, num_elements=%lld\n", (long long)num_elements);
     hipLaunchKernelGGL(cast_i64_to_f32_kernel,
@@ -287,6 +317,11 @@ extern "C" int hip_cast(
                        dim3(grid_size), dim3(kBlockSize), 0, hip_stream,
                        static_cast<const uint8_t*>(input),
                        static_cast<int32_t*>(output), num_elements);
+  } else if (input_dtype == HIP_DTYPE_UINT8 && output_dtype == HIP_DTYPE_BFLOAT16) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(cast_bfloat_kernel<uint8_t, __hip_bfloat16>),
+                       dim3(grid_size), dim3(kBlockSize), 0, hip_stream,
+                       static_cast<const uint8_t*>(input),
+                       static_cast<__hip_bfloat16*>(output), num_elements);
   } else if (input_dtype == HIP_DTYPE_UINT8 && output_dtype == HIP_DTYPE_FLOAT16) {
     hipLaunchKernelGGL(cast_ui8_to_f16_kernel,
                        dim3(grid_size), dim3(kBlockSize), 0, hip_stream,
@@ -329,5 +364,5 @@ extern "C" int hip_cast(
             "[custom_kernels] hip_cast launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }

@@ -841,6 +841,8 @@ void MlirCustomOp::compute_with_output_allocator(
   } catch (...) {
     drain();
     inference_state_->set_output_allocator(nullptr);
+    if (inference_state_->device_execution_failed())
+      throw Ort::Exception("HIP compiled device execution failed", ORT_EP_FAIL);
     throw;
   }
   drain();
@@ -853,6 +855,9 @@ void MlirCustomOp::compute_with_output_allocator(
   // Clear before octx leaves scope so a stale self pointer can never be used by
   // a later call (e.g. the next Compute() before it reinstalls its own ctx).
   inference_state_->set_output_allocator(nullptr);
+
+  if (inference_state_->device_execution_failed())
+    throw Ort::Exception("HIP compiled device execution failed", ORT_EP_FAIL);
 
   if (ret != 0) {
     throw std::runtime_error(

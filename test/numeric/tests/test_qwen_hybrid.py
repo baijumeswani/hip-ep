@@ -8,6 +8,7 @@
 import gc
 import json
 import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -94,7 +95,14 @@ def hybrid_sessions(request, tmp_path_factory):
     sessions.clear()
     devices.clear()
     gc.collect()
-    ort.unregister_execution_provider_library(provider)
+    if request.session.testsfailed:
+        warnings.warn(
+            "Retaining EP registration: failed-test tracebacks may still own native sessions.",
+            RuntimeWarning,
+            stacklevel=1,
+        )
+    else:
+        ort.unregister_execution_provider_library(provider)
 
 
 def run_bound(session, device, inputs, expected, alias=False, invalid=False):
@@ -256,6 +264,285 @@ def test_gated_delta_recurrence(hybrid_sessions, alias, lengths, dtype):
             bad_expected["output"] = expected["output"][:-1]
         run_bound(session, device, bad, bad_expected, alias, True)
     run_bound(session, device, inputs, expected, alias)
+
+
+def run_capture(session, device, inputs, output_shapes, *, alias=False, invalid=False):
+    memory = device.memory_info(ort.OrtDeviceMemoryType.DEFAULT)
+    binding = session.io_binding()
+    tensors, outputs = {}, {}
+    try:
+        for name, data in inputs.items():
+            if name == "active":
+                tensor = ort.OrtValue.ortvalue_from_numpy(data)
+            else:
+                tensor = ort.OrtValue.ortvalue_from_shape_and_type(
+                    data.shape, data.dtype, memory_info=memory
+                )
+                tensor.update_inplace(data)
+            tensors[name] = tensor
+            binding.bind_ortvalue_input(name, tensor)
+        for name, data in output_shapes.items():
+            if name == "present" and alias:
+                tensor = tensors["past"]
+            else:
+                tensor = ort.OrtValue.ortvalue_from_shape_and_type(
+                    data.shape, data.dtype, memory_info=memory
+                )
+                tensor.update_inplace(np.full_like(data, np.nan))
+            outputs[name] = tensor
+            binding.bind_ortvalue_output(name, tensor)
+        if invalid:
+            with pytest.raises(RuntimeError, match="inference_compute .* failed"):
+                session.run_with_iobinding(binding)
+            for name, tensor in tensors.items():
+                np.testing.assert_array_equal(tensor.numpy(), inputs[name])
+            assert np.isnan(outputs["output"].numpy()).all()
+            assert np.isnan(outputs["updates"].numpy()).all()
+            return None
+        session.run_with_iobinding(binding)
+        return {name: value.numpy().copy() for name, value in outputs.items()}
+    finally:
+        binding.clear_binding_inputs()
+        binding.clear_binding_outputs()
+        tensors.clear()
+        outputs.clear()
+        del binding, session
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("capacity", [1, 7])
+def test_convolution_compact_prefixes(hybrid_sessions, dtype, alias, capacity):
+    activation = helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+    channels = 10240
+    shapes = {
+        "input": (activation, ["tokens", channels]),
+        "weight": (activation, [channels, 1, 4]),
+        "cu": (TensorProto.INT32, ["batch_plus_one"]),
+        "bias": (activation, [channels]),
+        "past": (activation, ["batch", channels, 3]),
+        "counts": (TensorProto.INT32, ["capture_batch"]),
+    }
+    results = {
+        "output": shapes["input"],
+        "present": shapes["past"],
+        "updates": (activation, ["update_batch", capacity, channels]),
+    }
+    session, device = hybrid_sessions(
+        "VarlenCausalConvWithState",
+        shapes,
+        results,
+        activation="silu",
+        state_update_capacity=capacity,
+    )
+    base_session, _ = hybrid_sessions(
+        "VarlenCausalConvWithState",
+        {name: spec for name, spec in shapes.items() if name != "counts"},
+        {name: spec for name, spec in results.items() if name != "updates"},
+        activation="silu",
+    )
+    rng = np.random.default_rng(5011)
+    for lengths in ([8, 0, 11], [2, 8], [8, 0, 11]):
+        batch, tokens = len(lengths), sum(lengths)
+        inputs = {
+            "input": rng.normal(0, 0.3, (tokens, channels)).astype(dtype),
+            "weight": rng.normal(0, 0.2, (channels, 1, 4)).astype(dtype),
+            "cu": np.cumsum([0, *lengths], dtype=np.int32),
+            "bias": rng.normal(0, 0.1, channels).astype(dtype),
+            "past": rng.normal(0, 0.3, (batch, channels, 3)).astype(dtype),
+            "counts": np.full(batch, capacity, np.int32),
+        }
+        outputs = {
+            "output": np.empty_like(inputs["input"]),
+            "present": np.empty_like(inputs["past"]),
+            "updates": np.empty((batch, capacity, channels), dtype),
+        }
+        captured = run_capture(session, device, inputs, outputs, alias=alias)
+        baseline = run_capture(
+            base_session,
+            device,
+            {name: data for name, data in inputs.items() if name != "counts"},
+            {name: data for name, data in outputs.items() if name != "updates"},
+        )
+        for name in baseline:
+            np.testing.assert_array_equal(captured[name], baseline[name])
+        for b, (start, end) in enumerate(zip(inputs["cu"][:-1], inputs["cu"][1:])):
+            count = min(capacity, end - start)
+            np.testing.assert_array_equal(
+                captured["updates"][b, :count], inputs["input"][start : start + count]
+            )
+            np.testing.assert_array_equal(captured["updates"][b, count:], 0)
+            for kept in range(count + 1):
+                replayed = np.concatenate(
+                    [inputs["past"][b], captured["updates"][b, :kept].T], axis=1
+                )[:, -3:]
+                expected = np.concatenate(
+                    [inputs["past"][b], inputs["input"][start : start + kept].T], axis=1
+                )[:, -3:]
+                np.testing.assert_array_equal(replayed, expected)
+        zero = run_capture(
+            session, device, dict(inputs, counts=np.full(batch, -3, np.int32)), outputs
+        )
+        np.testing.assert_array_equal(zero["updates"], 0)
+        np.testing.assert_array_equal(zero["present"], captured["present"])
+        mixed_counts = np.arange(batch, dtype=np.int32) * 2
+        mixed = run_capture(session, device, dict(inputs, counts=mixed_counts), outputs)
+        high = run_capture(
+            session,
+            device,
+            dict(inputs, counts=np.full(batch, capacity + 9, np.int32)),
+            outputs,
+        )
+        np.testing.assert_array_equal(high["updates"], captured["updates"])
+        for b, length in enumerate(lengths):
+            count = min(capacity, mixed_counts[b], length)
+            np.testing.assert_array_equal(
+                mixed["updates"][b, :count], captured["updates"][b, :count]
+            )
+            np.testing.assert_array_equal(mixed["updates"][b, count:], 0)
+        for bad in (
+            dict(inputs, counts=inputs["counts"][:-1]),
+            dict(inputs, cu=np.array([0, -1, tokens], np.int32)),
+        ):
+            run_capture(session, device, bad, outputs, alias=alias, invalid=True)
+        run_capture(session, device, inputs, outputs, alias=alias)
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("capacity", [1, 7])
+def test_gated_delta_compact_prefixes(hybrid_sessions, dtype, alias, capacity):
+    activation = helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+    f32, i32 = TensorProto.FLOAT, TensorProto.INT32
+    heads, key_heads, width = 48, 16, 128
+    capsule_width = capacity * (heads + key_heads * width + heads * width)
+    shapes = {
+        "query": (activation, ["tokens", key_heads, width]),
+        "key": (activation, ["key_tokens", key_heads, width]),
+        "value": (activation, ["value_tokens", heads, width]),
+        "cu": (i32, ["batch_plus_one"]),
+        "decay": (f32, ["decay_tokens", heads]),
+        "beta": (f32, ["beta_tokens", heads]),
+        "past": (f32, ["batch", heads, width, width]),
+        "a_log": (f32, [heads]),
+        "dt_bias": (f32, [heads]),
+    }
+    base_results = {"output": shapes["value"], "present": shapes["past"]}
+    attrs = dict(
+        update_rule="gated_delta",
+        gate_activation="qwen",
+        beta_activation="sigmoid",
+        qk_l2_norm=1,
+        chunk_size=64,
+        scale=0.0,
+    )
+    base_session, device = hybrid_sessions(
+        "GatedDeltaNet", shapes, base_results, **attrs
+    )
+    session, _ = hybrid_sessions(
+        "GatedDeltaNet",
+        dict(shapes, counts=(i32, ["capture_batch"]), active=(i32, ["active_count"])),
+        dict(base_results, updates=(f32, ["update_batch", capsule_width])),
+        **attrs,
+        state_update_capacity=capacity,
+    )
+    rng = np.random.default_rng(5012)
+    lengths = [8, 0, 11]
+    batch, tokens = len(lengths), sum(lengths)
+    inputs = {
+        "query": rng.normal(0, 0.3, (tokens, key_heads, width)).astype(dtype),
+        "key": rng.normal(0, 0.3, (tokens, key_heads, width)).astype(dtype),
+        "value": rng.normal(0, 0.3, (tokens, heads, width)).astype(dtype),
+        "cu": np.cumsum([0, *lengths], dtype=np.int32),
+        "decay": rng.normal(-1, 1, (tokens, heads)).astype(np.float32),
+        "beta": rng.normal(0, 1, (tokens, heads)).astype(np.float32),
+        "past": rng.normal(0, 0.03, (batch, heads, width, width)).astype(np.float32),
+        "a_log": rng.normal(-2, 0.5, heads).astype(np.float32),
+        "dt_bias": rng.normal(0, 0.5, heads).astype(np.float32),
+    }
+    expected = delta_reference(inputs)
+    baseline = run_bound(base_session, device, inputs, expected)
+    controlled = dict(
+        inputs,
+        counts=np.full(batch, capacity, np.int32),
+        active=np.array([1], np.int32),
+    )
+    outputs = dict(expected, updates=np.empty((batch, capsule_width), np.float32))
+    captured = run_capture(session, device, controlled, outputs, alias=alias)
+    for name in baseline:
+        np.testing.assert_array_equal(captured[name], baseline[name])
+    decay_end = capacity * heads
+    key_end = decay_end + capacity * key_heads * width
+    decays = captured["updates"][:, :decay_end].reshape(batch, capacity, heads)
+    keys = captured["updates"][:, decay_end:key_end].reshape(
+        batch, capacity, key_heads, width
+    )
+    deltas = captured["updates"][:, key_end:].reshape(batch, capacity, heads, width)
+    for kept in range(capacity + 1):
+        replayed = inputs["past"].copy()
+        prefix_indices, cumulative = [], [0]
+        for b, (start, end) in enumerate(zip(inputs["cu"][:-1], inputs["cu"][1:])):
+            count = min(kept, end - start)
+            prefix_indices.extend(range(start, start + count))
+            cumulative.append(cumulative[-1] + count)
+            for t in range(count):
+                decayed = replayed[b] * decays[b, t, :, None, None]
+                key = keys[b, t].repeat(heads // key_heads, axis=0)[:, None, :]
+                replayed[b] = (
+                    key.astype(np.float64) * deltas[b, t, :, :, None].astype(np.float64)
+                    + decayed.astype(np.float64)
+                ).astype(np.float32)
+        if not kept:
+            np.testing.assert_array_equal(replayed, inputs["past"])
+            continue
+        prefix = dict(inputs, cu=np.asarray(cumulative, np.int32))
+        for name in ("query", "key", "value", "decay", "beta"):
+            prefix[name] = inputs[name][prefix_indices]
+        reference = delta_reference(prefix)
+        actual = run_bound(base_session, device, prefix, reference)
+        np.testing.assert_array_equal(replayed, actual["present"])
+    inactive = run_capture(
+        session, device, dict(controlled, active=np.array([0], np.int32)), outputs
+    )
+    np.testing.assert_array_equal(inactive["updates"], 0)
+    for name in baseline:
+        np.testing.assert_array_equal(inactive[name], captured[name])
+    high = run_capture(
+        session,
+        device,
+        dict(
+            controlled,
+            counts=np.full(batch, capacity + 9, np.int32),
+            active=np.array([-1], np.int32),
+        ),
+        outputs,
+    )
+    np.testing.assert_array_equal(high["updates"], captured["updates"])
+    mixed_counts = np.arange(batch, dtype=np.int32) * 2
+    mixed = run_capture(session, device, dict(controlled, counts=mixed_counts), outputs)
+    for b, length in enumerate(lengths):
+        count = min(capacity, mixed_counts[b], length)
+        for section_begin, section_end, dimensions in (
+            (0, decay_end, (capacity, heads)),
+            (decay_end, key_end, (capacity, key_heads, width)),
+            (key_end, capsule_width, (capacity, heads, width)),
+        ):
+            np.testing.assert_array_equal(
+                mixed["updates"][b, section_begin:section_end].reshape(dimensions)[
+                    :count
+                ],
+                captured["updates"][b, section_begin:section_end].reshape(dimensions)[
+                    :count
+                ],
+            )
+    for bad in (
+        dict(controlled, counts=controlled["counts"][:-1]),
+        dict(controlled, active=np.array([1, 0], np.int32)),
+        dict(controlled, key=controlled["key"][:-1]),
+        dict(controlled, cu=np.array([0, 8, 7, tokens], np.int32)),
+    ):
+        run_capture(session, device, bad, outputs, alias=alias, invalid=True)
+    run_capture(session, device, controlled, outputs, alias=alias)
 
 
 @pytest.mark.parametrize("dtype", [np.float16, np.float32])

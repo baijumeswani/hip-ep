@@ -242,6 +242,7 @@ struct RuntimeState {
   // Sticky host-side failures from runtime calls whose status the graph
   // ignores.
   int host_error_flag;
+  int execution_status;
 
   // hipDNN graph execution support.
   // Set by EP via hipdnn_graph_runtime_attach() after inference_init().

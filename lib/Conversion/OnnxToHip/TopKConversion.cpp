@@ -91,6 +91,8 @@ TopKToHip::matchAndRewrite(mlir::Operation *op,
   mlir::Value x = op->getOperand(0);
   mlir::Value k = op->getOperand(1);
   auto xType = mlir::cast<mlir::RankedTensorType>(x.getType());
+  if (xType.getElementType().isBF16())
+    return op->emitOpError("BF16 TopK is not supported");
 
   int64_t axis = -1;
   if (auto axisAttr = op->getAttrOfType<mlir::IntegerAttr>("axis"))
@@ -99,12 +101,12 @@ TopKToHip::matchAndRewrite(mlir::Operation *op,
     axis += xType.getRank();
 
   bool largest = true;
-  if (auto largestAttr = op->getAttrOfType<mlir::BoolAttr>("largest"))
-    largest = largestAttr.getValue();
+  if (auto largestAttr = op->getAttrOfType<mlir::IntegerAttr>("largest"))
+    largest = largestAttr.getInt() != 0;
 
   bool sorted = true;
-  if (auto sortedAttr = op->getAttrOfType<mlir::BoolAttr>("sorted"))
-    sorted = sortedAttr.getValue();
+  if (auto sortedAttr = op->getAttrOfType<mlir::IntegerAttr>("sorted"))
+    sorted = sortedAttr.getInt() != 0;
 
   // TopK's two results share an IDENTICAL shape; only the element type differs
   // (values inherit x's element type, indices are integer). Some exports drop

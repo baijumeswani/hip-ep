@@ -4,6 +4,7 @@
  */
 
 #include "../debug_log.h"
+#include "../execution_status.h"
 #include "../hipdnn_ep_runtime.h"
 #include "../op_profile.h"
 #include "hip_custom_kernels.h"
@@ -15,6 +16,7 @@ int wrap_top_k(RuntimeState *state, void *x, void *k, void *values,
                void *indices, int64_t axis, int64_t largest, int64_t sorted,
                int64_t rank, const int64_t *x_shape, int64_t num_elements,
                int64_t element_size_bytes) {
+  ExecutionStatusGuard execution_status(state);
   OP_PROFILE(
       "top_k",
       [&] {
@@ -37,13 +39,13 @@ int wrap_top_k(RuntimeState *state, void *x, void *k, void *values,
   if (err != hipSuccess) {
     fprintf(stderr, "[REAL] wrap_top_k: failed to read K: %s\n",
             hipGetErrorString(err));
-    return -1;
+    return execution_status.Finish(hipdnn_device_execution_status(err));
   }
   err = hipStreamSynchronize(static_cast<hipStream_t>(stream));
   if (err != hipSuccess) {
     fprintf(stderr, "[REAL] wrap_top_k: stream sync failed: %s\n",
             hipGetErrorString(err));
-    return -1;
+    return execution_status.Finish(hipdnn_device_execution_status(err));
   }
 
   RUNTIME_DEBUG_LOG(
@@ -52,6 +54,7 @@ int wrap_top_k(RuntimeState *state, void *x, void *k, void *values,
       (long long)axis, (long long)k_val, (long long)rank, (long long)largest,
       (long long)sorted);
 
-  return hip_top_k(stream, x, values, indices, axis, largest, sorted, rank,
-                   x_shape, k_val, static_cast<int>(element_size_bytes));
+  return execution_status.Finish(
+      hip_top_k(stream, x, values, indices, axis, largest, sorted, rank,
+                x_shape, k_val, static_cast<int>(element_size_bytes)));
 }

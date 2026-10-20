@@ -48,6 +48,9 @@ def make_model_from_nodes(
     [helper.make_opsetid("com.microsoft", 1)]. The ONNX checker is skipped
     when extra opsets are present since it cannot validate custom-domain
     operators.
+
+    Pin IR 10 so an ONNX package update does not raise the fixture's minimum
+    runtime version independently of the requested operator set.
     """
     graph = helper.make_graph(
         nodes, "test_graph", inputs, outputs, initializer=initializers or []
@@ -55,7 +58,7 @@ def make_model_from_nodes(
     opset_imports = [helper.make_opsetid("", opset)]
     if extra_opsets:
         opset_imports.extend(extra_opsets)
-    model = helper.make_model(graph, opset_imports=opset_imports)
+    model = helper.make_model(graph, opset_imports=opset_imports, ir_version=10)
     if extra_opsets is None:
         onnx.checker.check_model(model)
     return model

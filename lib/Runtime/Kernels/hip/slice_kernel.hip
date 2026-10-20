@@ -152,6 +152,12 @@ extern "C" int hip_slice(void *stream, const void *input, void *output,
                            hip_dtype, rank, (long long)num_output_elements);
 
   switch (hip_dtype) {
+  case HIP_DTYPE_BFLOAT16:
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(hip_slice_kernel<uint16_t>),
+                       dim3(grid_size), dim3(kBlockSize), 0, hip_stream,
+                       static_cast<const uint16_t *>(input),
+                       static_cast<uint16_t *>(output), p, num_output_elements);
+    break;
   case HIP_DTYPE_FLOAT16:
     hipLaunchKernelGGL(HIP_KERNEL_NAME(hip_slice_kernel<__half>),
                        dim3(grid_size), dim3(kBlockSize), 0, hip_stream,
@@ -187,5 +193,5 @@ extern "C" int hip_slice(void *stream, const void *input, void *output,
     fprintf(stderr, "[custom_kernels] hip_slice launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }

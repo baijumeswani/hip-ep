@@ -74,6 +74,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -2857,7 +2858,7 @@ extern "C" int hip_matmul_nbits_dp4a(
         launchDp4aMConfig(cfg, stream, a_qb, a_sc, Bp, sc, zp, bi, outp,
                           M, N, K, block_size);
     }
-    return hipGetLastError();
+    return hipdnn_device_execution_status(hipGetLastError());
 }
 
 /* -----------------------------------------------------------------------
@@ -4347,7 +4348,7 @@ extern "C" int hip_matmul_nbits_grouped_wmma(
     fprintf(stderr,
             "[custom_kernels] hip_matmul_nbits_grouped_wmma failed: %s\n",
             hipGetErrorString(err));
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }
 
 /* -----------------------------------------------------------------------
@@ -4730,7 +4731,7 @@ extern "C" int hip_matmul_nbits_wmma_smallm_grouped(
     fprintf(stderr,
             "[custom_kernels] hip_matmul_nbits_wmma_smallm_grouped failed: %s\n",
             hipGetErrorString(err));
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }
 
 #undef SMALLM_WMMA_CASES
@@ -5750,7 +5751,7 @@ extern "C" int hip_matmul_nbits_u4_prepack_padrow(
         dim3(BLK), 0, static_cast<hipStream_t>(stream),
         static_cast<const unsigned char*>(B), static_cast<unsigned char*>(dst),
         N, row_bytes, kU4PadRowBytes);
-    return static_cast<int>(hipGetLastError());
+    return hipdnn_device_execution_status(static_cast<int>(hipGetLastError()));
 }
 
 /* Fused int4 WMMA prefill against a B whose row stride may be padded.
@@ -5785,7 +5786,7 @@ extern "C" int hip_matmul_nbits_u4_wmma_stride(
 
     launchWmmaConfig(id, s, M, N, K, ap, lda, bp, sp, zp, group_size, ngk, cp,
                      ldc, has_zp, nullptr, b_row_bytes);
-    return static_cast<int>(hipGetLastError());
+    return hipdnn_device_execution_status(static_cast<int>(hipGetLastError()));
 }
 
 // One reusable scratch for the padded-row-stride B copy, shared across every
@@ -7972,12 +7973,12 @@ extern "C" void hip_matmul_nbits_convert_zp_fp16(
                        N, groups_k, packed_cols);
 }
 
-template <typename Scale, bool AlignedK, int Rows>
-__global__ void matmul_u4_block32_fp32_small_m(
-    const float *__restrict__ activations,
+template <typename Scale, bool AlignedK, int Rows, typename Activation>
+__global__ void matmul_u4_block32_typed_small_m(
+    const Activation *__restrict__ activations,
     const uint8_t *__restrict__ weights,
-    const Scale *__restrict__ scales, const float *__restrict__ bias,
-    float *__restrict__ output, int m, int n, int k) {
+    const Scale *__restrict__ scales, const Activation *__restrict__ bias,
+    Activation *__restrict__ output, int m, int n, int k) {
   // Independent 32-lane reductions also partition a wave64 into two channels.
   constexpr int reduction_width = 32;
   constexpr int channels_per_block = 256 / reduction_width;
@@ -8021,10 +8022,11 @@ __global__ void matmul_u4_block32_fp32_small_m(
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
         if (AlignedK || column + i < k) {
-          const float weight =
-              (static_cast<int>((packed >> (i * 4)) & 15) - 8) * scale;
+          const float weight = static_cast<float>(Activation(
+              (static_cast<int>((packed >> (i * 4)) & 15) - 8) * scale));
           const float value =
-              AlignedK ? values[i] : activations[(row + r) * k + column + i];
+              AlignedK ? values[i] :
+              static_cast<float>(activations[(row + r) * k + column + i]);
           sums[r][i % 4] = fmaf(value, weight, sums[r][i % 4]);
         }
       }
@@ -8037,56 +8039,84 @@ __global__ void matmul_u4_block32_fp32_small_m(
       for (int offset = reduction_width / 2; offset > 0; offset /= 2)
         sum += __shfl_down(sum, offset, reduction_width);
       if (lane == 0)
-        output[(row + r) * n + channel] = sum + (bias ? bias[channel] : 0.0f);
+        output[(row + r) * n + channel] =
+            Activation(sum + (bias ? static_cast<float>(bias[channel]) : 0.0f));
     }
   }
+}
+
+extern "C" HIP_KERNEL_API int hip_matmul_nbits_gemv_typed(
+    void *stream, const void *activations, const void *weights,
+    const void *scales, const void *bias, void *output, int m, int n, int k,
+    int activation_dtype, int scale_dtype) {
+  if (!stream || !activations || !weights || !scales || !output || m <= 0 ||
+      m > 16 || n <= 0 || k <= 0 ||
+      (activation_dtype != HIP_DTYPE_FLOAT32 && activation_dtype != HIP_DTYPE_BFLOAT16) ||
+      (scale_dtype != HIP_DTYPE_FLOAT16 && scale_dtype != HIP_DTYPE_FLOAT32 &&
+       scale_dtype != HIP_DTYPE_BFLOAT16))
+    return hipErrorInvalidValue;
+  (void)hipGetLastError();
+  const auto launch = [&](auto activation_tag, auto scale_tag, auto aligned_tag, auto rows_tag) {
+    using Activation = decltype(activation_tag);
+    using Scale = decltype(scale_tag);
+    constexpr bool aligned = decltype(aligned_tag)::value;
+    constexpr int rows = decltype(rows_tag)::value;
+    const dim3 grid((static_cast<int64_t>(n) + 7) / 8, (m + rows - 1) / rows);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(matmul_u4_block32_typed_small_m<Scale, aligned, rows, Activation>),
+        grid, dim3(256), 0, static_cast<hipStream_t>(stream),
+        static_cast<const Activation *>(activations),
+        static_cast<const uint8_t *>(weights),
+        static_cast<const Scale *>(scales), static_cast<const Activation *>(bias),
+        static_cast<Activation *>(output), m, n, k);
+  };
+  const auto launch_rows = [&](auto activation_tag, auto scale_tag, auto aligned_tag) {
+    // Two-row sharing regresses full-model decode despite isolated GEMV wins.
+    if (m <= 2)
+      launch(activation_tag, scale_tag, aligned_tag, std::integral_constant<int, 1>{});
+    else
+      launch(activation_tag, scale_tag, aligned_tag, std::integral_constant<int, 4>{});
+  };
+  const auto launch_scale = [&](auto activation_tag, auto scale_tag) {
+    if constexpr (std::is_same_v<decltype(activation_tag), float>) {
+      if (k % 32 == 0 &&
+          reinterpret_cast<uintptr_t>(activations) % alignof(float4) == 0)
+        launch_rows(activation_tag, scale_tag, std::true_type{});
+      else
+        launch_rows(activation_tag, scale_tag, std::false_type{});
+    } else
+      launch_rows(activation_tag, scale_tag, std::false_type{});
+  };
+  const auto dispatch_scales = [&](auto activation_tag) {
+    if (scale_dtype == HIP_DTYPE_FLOAT32)
+      launch_scale(activation_tag, float{});
+    else if (scale_dtype == HIP_DTYPE_FLOAT16)
+      launch_scale(activation_tag, _Float16{});
+    else
+      launch_scale(activation_tag, __hip_bfloat16{});
+  };
+  if (activation_dtype == HIP_DTYPE_FLOAT32)
+    dispatch_scales(float{});
+  else
+    dispatch_scales(__hip_bfloat16{});
+  return hipdnn_device_execution_status(hipGetLastError());
 }
 
 extern "C" HIP_KERNEL_API int hip_matmul_nbits_gemv_fp32(
     void *stream, const float *activations, const void *weights,
     const void *scales, const float *bias, float *output, int m, int n, int k,
     int scale_element_size) {
-  if (!stream || !activations || !weights || !scales || !output || m <= 0 ||
-      m > 16 || n <= 0 || k <= 0 ||
-      (scale_element_size != 2 && scale_element_size != 4))
+  if (scale_element_size != 2 && scale_element_size != 4)
     return hipErrorInvalidValue;
-  (void)hipGetLastError();
-  const auto launch = [&](auto scale_tag, auto aligned_tag, auto rows_tag) {
-    using Scale = decltype(scale_tag);
-    constexpr bool aligned = decltype(aligned_tag)::value;
-    constexpr int rows = decltype(rows_tag)::value;
-    const dim3 grid((static_cast<int64_t>(n) + 7) / 8, (m + rows - 1) / rows);
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(matmul_u4_block32_fp32_small_m<Scale, aligned, rows>),
-        grid, dim3(256), 0, static_cast<hipStream_t>(stream), activations,
-        static_cast<const uint8_t *>(weights),
-        static_cast<const Scale *>(scales), bias, output, m, n, k);
-  };
-  const auto launch_rows = [&](auto scale_tag, auto aligned_tag) {
-    // Two-row sharing regresses full-model decode despite isolated GEMV wins.
-    if (m <= 2)
-      launch(scale_tag, aligned_tag, std::integral_constant<int, 1>{});
-    else
-      launch(scale_tag, aligned_tag, std::integral_constant<int, 4>{});
-  };
-  const bool vector_loads =
-      k % 32 == 0 &&
-      reinterpret_cast<uintptr_t>(activations) % alignof(float4) == 0;
-  if (scale_element_size == 4 && vector_loads) {
-    launch_rows(float{}, std::true_type{});
-  } else if (scale_element_size == 2 && vector_loads) {
-    launch_rows(_Float16{}, std::true_type{});
-  } else if (scale_element_size == 4) {
-    launch_rows(float{}, std::false_type{});
-  } else {
-    launch_rows(_Float16{}, std::false_type{});
-  }
-  return hipGetLastError();
+  return hip_matmul_nbits_gemv_typed(
+      stream, activations, weights, scales, bias, output, m, n, k,
+      HIP_DTYPE_FLOAT32,
+      scale_element_size == 4 ? HIP_DTYPE_FLOAT32 : HIP_DTYPE_FLOAT16);
 }
 
-__global__ void dequant_u4_block32_to_fp32(
-    const unsigned char *weights, const void *scales, float *output,
-    int k, int scale_element_size) {
+template <typename Output, typename Scale>
+__global__ void dequant_u4_block32_typed(
+    const unsigned char *weights, const Scale *scales, Output *output, int k) {
   const int64_t column = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (column >= k)
     return;
@@ -8095,26 +8125,53 @@ __global__ void dequant_u4_block32_to_fp32(
   const int64_t group = row * groups + column / 32;
   const unsigned char packed = weights[group * 16 + (column % 32) / 2];
   const int value = ((column & 1) ? packed >> 4 : packed & 15) - 8;
-  const float scale = scale_element_size == 4
-                          ? static_cast<const float *>(scales)[group]
-                          : static_cast<float>(static_cast<const _Float16 *>(scales)[group]);
-  output[row * k + column] = value * scale;
+  const float scale = static_cast<float>(scales[group]);
+  output[row * k + column] = Output(value * scale);
+}
+
+extern "C" HIP_KERNEL_API int hip_matmul_nbits_dequant_b_typed(
+    void *stream, const void *weights, const void *scales, void *output,
+    int n, int k, int output_dtype, int scale_dtype) {
+  if (!stream || !weights || !scales || !output || n <= 0 || n > 65535 ||
+      k <= 0 ||
+      (output_dtype != HIP_DTYPE_FLOAT32 && output_dtype != HIP_DTYPE_BFLOAT16) ||
+      (scale_dtype != HIP_DTYPE_FLOAT16 && scale_dtype != HIP_DTYPE_FLOAT32 &&
+       scale_dtype != HIP_DTYPE_BFLOAT16))
+    return hipErrorInvalidValue;
+  (void)hipGetLastError();
+  const auto launch = [&](auto output_tag, auto scale_tag) {
+    using Output = decltype(output_tag);
+    using Scale = decltype(scale_tag);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(dequant_u4_block32_typed<Output, Scale>),
+        dim3((static_cast<int64_t>(k) + 255) / 256, n), dim3(256), 0,
+        static_cast<hipStream_t>(stream),
+        static_cast<const unsigned char *>(weights),
+        static_cast<const Scale *>(scales), static_cast<Output *>(output), k);
+  };
+  const auto dispatch_scales = [&](auto output_tag) {
+    if (scale_dtype == HIP_DTYPE_FLOAT32)
+      launch(output_tag, float{});
+    else if (scale_dtype == HIP_DTYPE_FLOAT16)
+      launch(output_tag, _Float16{});
+    else
+      launch(output_tag, __hip_bfloat16{});
+  };
+  if (output_dtype == HIP_DTYPE_FLOAT32)
+    dispatch_scales(float{});
+  else
+    dispatch_scales(__hip_bfloat16{});
+  return hipdnn_device_execution_status(hipGetLastError());
 }
 
 extern "C" HIP_KERNEL_API int hip_matmul_nbits_dequant_b_fp32(
     void *stream, const void *weights, const void *scales, float *output,
     int n, int k, int scale_element_size) {
-  if (!stream || !weights || !scales || !output || n <= 0 || n > 65535 ||
-      k <= 0 || (scale_element_size != 2 && scale_element_size != 4))
+  if (scale_element_size != 2 && scale_element_size != 4)
     return hipErrorInvalidValue;
-  (void)hipGetLastError();
-  hipLaunchKernelGGL(
-      dequant_u4_block32_to_fp32,
-      dim3((static_cast<int64_t>(k) + 255) / 256, n), dim3(256), 0,
-      static_cast<hipStream_t>(stream),
-      static_cast<const unsigned char *>(weights), scales, output, k,
-      scale_element_size);
-  return hipGetLastError();
+  return hip_matmul_nbits_dequant_b_typed(
+      stream, weights, scales, output, n, k, HIP_DTYPE_FLOAT32,
+      scale_element_size == 4 ? HIP_DTYPE_FLOAT32 : HIP_DTYPE_FLOAT16);
 }
 
 // Full-weight int4 -> fp16 dequantization into a row-major [N, K] buffer, used
@@ -8309,7 +8366,7 @@ extern "C" int hip_matmul_nbits(
               "[custom_kernels] hip_matmul_nbits: fp32 cast convert launch failed: %s\n",
               hipGetErrorString(err));
     }
-    return static_cast<int>(err);
+    return hipdnn_device_execution_status(static_cast<int>(err));
   }
 
   if (element_size_bytes != 2) {
@@ -8475,7 +8532,7 @@ extern "C" int hip_matmul_nbits(
               "[custom_kernels] hip_matmul_nbits int8 launch failed: %s\n",
               hipGetErrorString(err));
     }
-    return static_cast<int>(err);
+    return hipdnn_device_execution_status(static_cast<int>(err));
   }
 
   /* -------------------------------------------------------------------
@@ -8649,7 +8706,7 @@ extern "C" int hip_matmul_nbits(
               "[custom_kernels] hip_matmul_nbits u2 launch failed: %s\n",
               hipGetErrorString(err));
     }
-    return static_cast<int>(err);
+    return hipdnn_device_execution_status(static_cast<int>(err));
   }
 
   /* -------------------------------------------------------------------
@@ -8792,7 +8849,7 @@ extern "C" int hip_matmul_nbits(
               "[custom_kernels] hip_matmul_nbits u3 launch failed: %s\n",
               hipGetErrorString(err));
     }
-    return static_cast<int>(err);
+    return hipdnn_device_execution_status(static_cast<int>(err));
   }
 
   // Packed nibble ZPs [N, ceil(k_blocks/2)] must be unpacked before use:
@@ -8955,7 +9012,7 @@ extern "C" int hip_matmul_nbits(
       fprintf(stderr,
               "[custom_kernels] hip_matmul_nbits WMMA K-pad launch failed: %s\n",
               hipGetErrorString(err));
-      return static_cast<int>(err);
+      return hipdnn_device_execution_status(static_cast<int>(err));
     }
 
     if (bias) {
@@ -8965,7 +9022,7 @@ extern "C" int hip_matmul_nbits(
                          hip_stream, out_ptr,
                          static_cast<const _Float16*>(bias), iM, iN, ldc);
     }
-    return static_cast<int>(hipGetLastError());
+    return hipdnn_device_execution_status(static_cast<int>(hipGetLastError()));
   }
 
   // WMMA is an RDNA3/RDNA4 (wave32) intrinsic. On CDNA (wave64, e.g. MI350)
@@ -9012,7 +9069,7 @@ extern "C" int hip_matmul_nbits(
       fprintf(stderr,
               "[custom_kernels] hip_matmul_nbits WMMA launch failed: %s\n",
               hipGetErrorString(err));
-      return static_cast<int>(err);
+      return hipdnn_device_execution_status(static_cast<int>(err));
     }
 
     if (bias) {
@@ -9029,11 +9086,11 @@ extern "C" int hip_matmul_nbits(
         fprintf(stderr,
                 "[custom_kernels] hip_matmul_nbits bias launch failed: %s\n",
                 hipGetErrorString(err));
-        return static_cast<int>(err);
+        return hipdnn_device_execution_status(static_cast<int>(err));
       }
     }
 
-    return static_cast<int>(hipGetLastError());
+    return hipdnn_device_execution_status(static_cast<int>(hipGetLastError()));
   };
 
   /* -------------------------------------------------------------------
@@ -9089,11 +9146,11 @@ extern "C" int hip_matmul_nbits(
               "[custom_kernels] hip_matmul_nbits GEMV M-blocked launch "
               "failed: %s\n",
               hipGetErrorString(err));
-      return static_cast<int>(err);
+      return hipdnn_device_execution_status(static_cast<int>(err));
     }
 
     launchTranspose2DFp16(hip_stream, o_col, output, iN, iM);
-    return static_cast<int>(hipGetLastError());
+    return hipdnn_device_execution_status(static_cast<int>(hipGetLastError()));
   };
 
   auto run_gemv_col_int4 = [&]() -> int {
@@ -9145,7 +9202,7 @@ extern "C" int hip_matmul_nbits(
               "[custom_kernels] hip_matmul_nbits GEMV col-major launch "
               "failed: %s\n",
               hipGetErrorString(err));
-      return static_cast<int>(err);
+      return hipdnn_device_execution_status(static_cast<int>(err));
     }
 
     // Col-major output -> row-major (skip if M==1)
@@ -9159,7 +9216,7 @@ extern "C" int hip_matmul_nbits(
                 hipGetErrorString(err));
       }
     }
-    return static_cast<int>(err);
+    return hipdnn_device_execution_status(static_cast<int>(err));
   };
 
   /* -------------------------------------------------------------------
@@ -9251,7 +9308,7 @@ extern "C" int hip_matmul_nbits(
               "[custom_kernels] hip_matmul_nbits GEMV launch failed: %s\n",
               hipGetErrorString(err));
     }
-    return static_cast<int>(err);
+    return hipdnn_device_execution_status(static_cast<int>(err));
   }
 
   /* -------------------------------------------------------------------
@@ -9283,5 +9340,5 @@ extern "C" int hip_matmul_nbits(
             "[custom_kernels] hip_matmul_nbits naive launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }

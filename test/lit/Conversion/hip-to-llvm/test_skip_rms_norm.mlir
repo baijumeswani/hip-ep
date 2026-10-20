@@ -9,7 +9,7 @@
 // This test validates:
 // - Static shape lowering: constants for dimensions
 // - Dynamic shape lowering: runtime extraction from memref descriptors
-// - Element type support: f32, f16
+// - Element type support: f32, f16, bf16
 // - Tensor rank support: 2D, 3D
 // - Num elements computation: product of all dimensions for input and gamma
 // - Attribute lowering: epsilon passed to runtime
@@ -25,6 +25,21 @@
 // ============================================================================
 
 // RUN: hip-mlir-opt %s --convert-hip-to-llvm | FileCheck %s
+
+// CHECK-LABEL: @skip_rms_norm_bf16
+func.func @skip_rms_norm_bf16(%ctx: !hip.context,
+                              %input: memref<8x5120xbf16, 1>,
+                              %skip: memref<8x5120xbf16, 1>,
+                              %gamma: memref<5120xbf16, 1>,
+                              %output: memref<8x5120xbf16, 1>) {
+  // CHECK: %[[BF16:.*]] = llvm.mlir.constant(2 : i64)
+  // CHECK: llvm.call @wrap_skip_simplified_layer_norm({{.*}}, %[[BF16]], %{{[^)]+}})
+  hip.skip_rms_norm(%ctx)
+      ins(%input, %skip, %gamma : memref<8x5120xbf16, 1>, memref<8x5120xbf16, 1>, memref<5120xbf16, 1>)
+      outs(%output : memref<8x5120xbf16, 1>)
+      {epsilon = 1.0e-05 : f32}
+  return
+}
 
 // ===== Static shape tests =====
 

@@ -439,7 +439,7 @@ int wrap_hipblasLtGemm(void *handle, void *stream, int64_t m, int64_t n,
 
 int wrap_hipblasLtMatmul(RuntimeState *state, int op_state_slot, const void *A,
                          const void *B, void *output, int64_t M, int64_t N,
-                         int64_t K, int64_t batch_count, int64_t elem_size,
+                         int64_t K, int64_t batch_count, int64_t data_type,
                          int64_t b_batch_stride, int64_t transA,
                          int64_t transB) {
   (void)b_batch_stride;
@@ -452,9 +452,9 @@ int wrap_hipblasLtMatmul(RuntimeState *state, int op_state_slot, const void *A,
   }
 
   MOCK_PRINT("[MOCK] wrap_hipblasLtMatmul(M=%lld, N=%lld, K=%lld, "
-             "batch=%lld, elem_size=%lld, transA=%lld, transB=%lld)\n",
+             "batch=%lld, data_type=%lld, transA=%lld, transB=%lld)\n",
              (long long)M, (long long)N, (long long)K, (long long)batch_count,
-             (long long)elem_size, (long long)transA, (long long)transB);
+             (long long)data_type, (long long)transA, (long long)transB);
 
   return 0;
 }
@@ -510,6 +510,24 @@ int wrap_gated_rms_norm(RuntimeState *state, void *, void *, void *, void *,
   return RejectQwenHybrid(state);
 }
 
+int wrap_varlen_causal_conv_updates(RuntimeState *state, void *, void *, void *,
+                                    void *, void *, void *, void *, void *,
+                                    void *, int64_t, int64_t, int64_t, int64_t,
+                                    int64_t, int64_t, int64_t, int64_t, int64_t,
+                                    int64_t, int64_t, int64_t) {
+  return RejectQwenHybrid(state);
+}
+
+int wrap_gated_delta_net_updates(RuntimeState *state, void *, void *, void *,
+                                 void *, void *, void *, void *, void *, void *,
+                                 void *, void *, void *, void *, void *,
+                                 int64_t, int64_t, int64_t, int64_t, int64_t,
+                                 int64_t, int64_t, int64_t, int64_t, int64_t,
+                                 int64_t, int64_t, int64_t, int64_t, int64_t,
+                                 int64_t, float, int64_t) {
+  return RejectQwenHybrid(state);
+}
+
 int wrap_mrotary_embedding(RuntimeState *state, void *, void *, void *, void *,
                            void *, int64_t, int64_t, int64_t, int64_t, int64_t,
                            int64_t) {
@@ -526,6 +544,25 @@ int wrap_paged_attention(RuntimeState *state, void *, void *, void *, void *,
   if (auto *error = hipdnn_ep_state_get_error_flag_device_ptr(state))
     std::memset(error, 0xff, sizeof(int));
   return -1;
+}
+
+int wrap_paged_attention_bf16(RuntimeState *state, void *, void *, void *,
+                              void *, void *, void *, void *, void *, void *,
+                              void *, void *, void *, void *, int64_t, int64_t,
+                              int64_t, int64_t, int64_t, int64_t, int64_t,
+                              int64_t, int64_t, int64_t, int64_t, int64_t,
+                              int64_t, int64_t, int64_t, int64_t, int64_t,
+                              int64_t, int64_t, float, float) {
+  return RejectQwenHybrid(state);
+}
+
+int wrap_paged_attention_bf16_separate(
+    RuntimeState *state, void *, void *, void *, void *, void *, void *, void *,
+    void *, void *, void *, void *, void *, void *, void *, void *, int64_t,
+    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int64_t, int64_t, int64_t, int64_t, float, float) {
+  return RejectQwenHybrid(state);
 }
 
 int wrap_paged_attention_separate(RuntimeState *state, void *, void *, void *,
@@ -1390,8 +1427,8 @@ int wrap_rotary_embedding(RuntimeState *state, void *input, void *position_ids,
 
 int wrap_rms_norm(RuntimeState *state, void *input, void *scale, void *output,
                   int64_t input_num_elements, int64_t scale_num_elements,
-                  int64_t norm_num_elements, int64_t element_size_bytes,
-                  int64_t axis, float epsilon, int64_t stash_type) {
+                  int64_t norm_num_elements, int64_t data_type, int64_t axis,
+                  float epsilon, int64_t stash_type) {
   if (!state) {
     fprintf(stderr, "Invalid state in wrap_rms_norm\n");
     return -1;
@@ -1399,9 +1436,9 @@ int wrap_rms_norm(RuntimeState *state, void *input, void *scale, void *output,
 
   MOCK_PRINT("[MOCK] wrap_rms_norm(input_num_elements=%lld, "
              "scale_num_elements=%lld, norm_num_elements=%lld, "
-             "element_size=%lld, axis=%lld, epsilon=%f, stash_type=%lld)\n",
+             "data_type=%lld, axis=%lld, epsilon=%f, stash_type=%lld)\n",
              (long long)input_num_elements, (long long)scale_num_elements,
-             (long long)norm_num_elements, (long long)element_size_bytes,
+             (long long)norm_num_elements, (long long)data_type,
              (long long)axis, (double)epsilon, (long long)stash_type);
 
   return 0;
@@ -1412,18 +1449,18 @@ int wrap_skip_simplified_layer_norm(RuntimeState *state, void *input,
                                     void *output, void *input_skip_bias_sum,
                                     int64_t input_num_elements,
                                     int64_t gamma_num_elements,
-                                    int64_t element_size_bytes, float epsilon) {
+                                    int64_t data_type, float epsilon) {
   if (!state) {
     fprintf(stderr, "Invalid state in wrap_skip_simplified_layer_norm\n");
     return -1;
   }
 
   MOCK_PRINT("[MOCK] wrap_skip_simplified_layer_norm(input_num_elements=%lld, "
-             "gamma_num_elements=%lld, element_size=%lld, epsilon=%f, "
+             "gamma_num_elements=%lld, data_type=%lld, epsilon=%f, "
              "bias=%s, input_skip_bias_sum=%s)\n",
              (long long)input_num_elements, (long long)gamma_num_elements,
-             (long long)element_size_bytes, (double)epsilon,
-             bias ? "yes" : "no", input_skip_bias_sum ? "yes" : "no");
+             (long long)data_type, (double)epsilon, bias ? "yes" : "no",
+             input_skip_bias_sum ? "yes" : "no");
 
   return 0;
 }
@@ -1433,20 +1470,20 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
                       const void *zero_points, const void *g_idx,
                       const void *bias, void *output, int64_t M, int64_t N,
                       int64_t K, int64_t batch_count, int64_t bits,
-                      int64_t block_size, int64_t elem_size,
-                      int64_t zp_elem_size, int64_t scale_elem_size) {
+                      int64_t block_size, int64_t data_type,
+                      int64_t zp_elem_size, int64_t scale_data_type) {
   (void)op_state_slot;
-  (void)scale_elem_size;
+  (void)scale_data_type;
   if (!state) {
     fprintf(stderr, "Invalid state in wrap_matmul_nbits\n");
     return -1;
   }
 
   MOCK_PRINT("[MOCK] wrap_matmul_nbits(M=%lld, N=%lld, K=%lld, "
-             "batch=%lld, bits=%lld, block_size=%lld, elem_size=%lld, "
+             "batch=%lld, bits=%lld, block_size=%lld, data_type=%lld, "
              "zero_points=%s, g_idx=%s, bias=%s)\n",
              (long long)M, (long long)N, (long long)K, (long long)batch_count,
-             (long long)bits, (long long)block_size, (long long)elem_size,
+             (long long)bits, (long long)block_size, (long long)data_type,
              zero_points ? "yes" : "null", g_idx ? "yes" : "null",
              bias ? "yes" : "null");
 

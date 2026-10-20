@@ -3,6 +3,7 @@
  * Licensed under the MIT License.
  */
 #include "../debug_log.h"
+#include "../execution_status.h"
 #include "../hipdnn_ep_runtime.h"
 #include "../op_profile.h"
 #include "../op_state.h"
@@ -71,16 +72,17 @@ extern "C" int8_t hipdnn_ep_op_state_construct_optensor(RuntimeState *state,
 // before the flat kernel runs; the float path broadcasts natively (dimension
 // 1 in one operand vs >1 in the other) without materialisation.
 // The compiler (HipToLLVM) left-pads shapes with 1 for rank < 4.
-// Currently supported data_types: float16, float32, int32, int64, int16
+// Currently supported data_types: float16, float32, int32, int64, int16;
+// BF16 supports ADD/MUL.
 // Currently supported tensor_ops: MUL, ADD, MIN, MAX
 //===----------------------------------------------------------------------===//
 
-int wrap_elementwise(RuntimeState *state, int op_state_slot, void *lhs,
-                     void *rhs, void *output, int64_t lhs_n, int64_t lhs_c,
-                     int64_t lhs_h, int64_t lhs_w, int64_t rhs_n, int64_t rhs_c,
-                     int64_t rhs_h, int64_t rhs_w, int64_t out_n, int64_t out_c,
-                     int64_t out_h, int64_t out_w, int64_t data_type,
-                     int64_t tensor_op) {
+static int RunElementwise(RuntimeState *state, int op_state_slot, void *lhs,
+                          void *rhs, void *output, int64_t lhs_n, int64_t lhs_c,
+                          int64_t lhs_h, int64_t lhs_w, int64_t rhs_n,
+                          int64_t rhs_c, int64_t rhs_h, int64_t rhs_w,
+                          int64_t out_n, int64_t out_c, int64_t out_h,
+                          int64_t out_w, int64_t data_type, int64_t tensor_op) {
   OP_PROFILE(
       "elementwise",
       [&] {
@@ -146,6 +148,7 @@ int wrap_elementwise(RuntimeState *state, int op_state_slot, void *lhs,
       size_t elem_size = 0;
       switch (data_type) {
       case HIPDNN_EP_DATATYPE_HALF:
+      case HIPDNN_EP_DATATYPE_BFLOAT16:
         elem_size = 2;
         break;
       case HIPDNN_EP_DATATYPE_FLOAT:
@@ -177,6 +180,10 @@ int wrap_elementwise(RuntimeState *state, int op_state_slot, void *lhs,
         return -1;
       }
       return 0;
+    }
+    if (data_type == HIPDNN_EP_DATATYPE_BFLOAT16) {
+      fprintf(stderr, "[elementwise-empty] invalid BF16 broadcast shape\n");
+      return -1;
     }
     // Neither operand matches OUT — undefined broadcast. Zero-fill OUT
     // as a safe default (matches CPU treating empty as additive identity
@@ -307,14 +314,17 @@ int wrap_elementwise(RuntimeState *state, int op_state_slot, void *lhs,
     return rc;
   }
 
-  // Float/half Add/Mul/Min/Max fast path: a single broadcasting HIP kernel.
+  // Float/half Add/Mul/Min/Max and BF16 Add/Mul use native broadcasting.
   // The custom kernel does this work in well under a millisecond with fully
   // coalesced output writes and native per-axis broadcasting (no Expand
-  // materialisation). bf16, any op not in {ADD,MUL,MIN,MAX}, or an output
+  // materialisation). Unsupported dtype/op combinations or an output
   // volume exceeding the kernel's 32-bit index range fall through to the
   // unsupported-combination error below -- there is no fallback.
   if ((data_type == HIPDNN_EP_DATATYPE_HALF ||
-       data_type == HIPDNN_EP_DATATYPE_FLOAT) &&
+       data_type == HIPDNN_EP_DATATYPE_FLOAT ||
+       (data_type == HIPDNN_EP_DATATYPE_BFLOAT16 &&
+        (tensor_op == HIPDNN_EP_TENSOR_OP_ADD ||
+         tensor_op == HIPDNN_EP_TENSOR_OP_MUL))) &&
       (tensor_op == HIPDNN_EP_TENSOR_OP_ADD ||
        tensor_op == HIPDNN_EP_TENSOR_OP_MUL ||
        tensor_op == HIPDNN_EP_TENSOR_OP_MIN ||
@@ -341,6 +351,18 @@ int wrap_elementwise(RuntimeState *state, int op_state_slot, void *lhs,
   fprintf(stderr, "wrap_elementwise: not support datatype: %s, op: %s\n",
           type_name, op_name);
   return -1;
+}
+
+int wrap_elementwise(RuntimeState *state, int op_state_slot, void *lhs,
+                     void *rhs, void *output, int64_t lhs_n, int64_t lhs_c,
+                     int64_t lhs_h, int64_t lhs_w, int64_t rhs_n, int64_t rhs_c,
+                     int64_t rhs_h, int64_t rhs_w, int64_t out_n, int64_t out_c,
+                     int64_t out_h, int64_t out_w, int64_t data_type,
+                     int64_t tensor_op) {
+  ExecutionStatusGuard execution_status(state);
+  return execution_status.Finish(RunElementwise(
+      state, op_state_slot, lhs, rhs, output, lhs_n, lhs_c, lhs_h, lhs_w, rhs_n,
+      rhs_c, rhs_h, rhs_w, out_n, out_c, out_h, out_w, data_type, tensor_op));
 }
 
 static int sub_hipdnn_to_hip_dtype(int64_t hipdnn_type) {

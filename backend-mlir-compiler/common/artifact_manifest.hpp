@@ -66,7 +66,7 @@ inline ArtifactCompatibility
 artifactCompatibility(const morphizen::PassContext &context) {
   ArtifactCompatibility result{
       {"manifest_version", "1"},
-      {"runtime_abi", "3"},
+      {"runtime_abi", "6"},
       {"compiler_build",
        artifactSha256(morphizen_get_build_info(),
                       std::strlen(morphizen_get_build_info()))},

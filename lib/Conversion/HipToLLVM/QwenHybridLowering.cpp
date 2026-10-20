@@ -40,20 +40,41 @@ template <typename Op> struct QwenHybridLowering : ConvertOpToLLVMPattern<Op> {
       signature.push_back(rewriter.getF32Type());
     };
     StringRef functionName;
-    if constexpr (std::is_same_v<Op, VarlenCausalConvOp>) {
-      functionName = "wrap_varlen_causal_conv";
+    if constexpr (std::is_same_v<Op, VarlenCausalConvOp> ||
+                  std::is_same_v<Op, VarlenCausalConvUpdatesOp>) {
+      constexpr bool capture = std::is_same_v<Op, VarlenCausalConvUpdatesOp>;
+      functionName = capture ? "wrap_varlen_causal_conv_updates"
+                             : "wrap_varlen_causal_conv";
       dim(1, 0);
-      dim(6, 0);
+      dim(capture ? 7 : 6, 0);
       dim(3, 0);
       dim(5, 0);
-      dim(7, 0);
+      dim(capture ? 8 : 7, 0);
       dim(1, 1);
-    } else if constexpr (std::is_same_v<Op, GatedDeltaNetOp>) {
-      functionName = "wrap_gated_delta_net";
-      for (unsigned operand : {1u, 2u, 3u, 5u, 6u, 4u, 7u, 11u, 10u})
+      if constexpr (capture) {
+        dim(6, 0);
+        for (unsigned index : {0u, 1u, 2u})
+          dim(9, index);
+        integer(op.getStateUpdateCapacity());
+      }
+    } else if constexpr (std::is_same_v<Op, GatedDeltaNetOp> ||
+                         std::is_same_v<Op, GatedDeltaNetUpdatesOp>) {
+      constexpr bool capture = std::is_same_v<Op, GatedDeltaNetUpdatesOp>;
+      functionName =
+          capture ? "wrap_gated_delta_net_updates" : "wrap_gated_delta_net";
+      for (unsigned operand : {1u, 2u, 3u, 5u, 6u, 4u, 7u, capture ? 13u : 11u,
+                               capture ? 12u : 10u})
         dim(operand, 0);
+      if constexpr (capture) {
+        dim(10, 0);
+        dim(11, 0);
+        dim(14, 0);
+        dim(14, 1);
+      }
       integer(op.getKeyHeads());
       integer(op.getValueHeads());
+      if constexpr (capture)
+        integer(op.getStateUpdateCapacity());
       floating(op.getScaleAttr());
     } else if constexpr (std::is_same_v<Op, GatedRmsNormOp>) {
       functionName = "wrap_gated_rms_norm";
@@ -90,6 +111,8 @@ void populateQwenHybridLoweringPatterns(const LLVMTypeConverter &converter,
                                         RewritePatternSet &patterns) {
   patterns.add<QwenHybridLowering<VarlenCausalConvOp>,
                QwenHybridLowering<GatedDeltaNetOp>,
+               QwenHybridLowering<VarlenCausalConvUpdatesOp>,
+               QwenHybridLowering<GatedDeltaNetUpdatesOp>,
                QwenHybridLowering<GatedRmsNormOp>,
                QwenHybridLowering<MRotaryEmbeddingOp>>(converter);
 }

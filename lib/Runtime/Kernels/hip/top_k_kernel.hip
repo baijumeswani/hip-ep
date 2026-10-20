@@ -138,6 +138,71 @@ __global__ void top_k_kernel(const T *__restrict__ data, T *__restrict__ values,
   topk_row(data, values, indices, geom, row_id, largest, sorted);
 }
 
+__global__ void top_k_last_axis_f32(
+    const float *__restrict__ data, float *__restrict__ values,
+    int64_t *__restrict__ indices, TopKGeom geom, int largest, int sorted) {
+  constexpr int threads = 256;
+  __shared__ float candidates[threads];
+  __shared__ int64_t candidate_indices[threads];
+  __shared__ float previous_value;
+  __shared__ int64_t previous_index;
+  __shared__ int has_nan;
+  const int lane = threadIdx.x;
+  const int64_t row = blockIdx.x;
+  if (lane == 0)
+    has_nan = 0;
+  __syncthreads();
+  const auto better = [largest] __device__(float a, int64_t ai, float b,
+                                           int64_t bi) {
+    return ai >= 0 &&
+           (bi < 0 || (largest ? a > b : a < b) || (a == b && ai < bi));
+  };
+  for (int64_t selected = 0; selected < geom.k; ++selected) {
+    float best = 0;
+    int64_t best_index = -1;
+    bool nan_seen = false;
+    for (int64_t i = lane; i < geom.axis_size; i += threads) {
+      const float candidate = data[row * geom.axis_size + i];
+      nan_seen |= isnan(candidate);
+      if (selected != 0 &&
+          (i == previous_index ||
+           better(candidate, i, previous_value, previous_index)))
+        continue;
+      if (better(candidate, i, best, best_index)) {
+        best = candidate;
+        best_index = i;
+      }
+    }
+    if (nan_seen)
+      atomicExch(&has_nan, 1);
+    candidates[lane] = best;
+    candidate_indices[lane] = best_index;
+    __syncthreads();
+    if (has_nan) {
+      // Preserve the legacy scan's order-dependent treatment of NaNs.
+      if (lane == 0)
+        topk_row(data, values, indices, geom, row, largest, sorted);
+      return;
+    }
+    for (int width = threads / 2; width; width /= 2) {
+      if (lane < width &&
+          better(candidates[lane + width], candidate_indices[lane + width],
+                 candidates[lane], candidate_indices[lane])) {
+        candidates[lane] = candidates[lane + width];
+        candidate_indices[lane] = candidate_indices[lane + width];
+      }
+      __syncthreads();
+    }
+    if (lane == 0) {
+      previous_value = candidates[0];
+      previous_index = candidate_indices[0];
+      values[row * geom.k + selected] = previous_value;
+      indices[row * geom.k + selected] = previous_index;
+    }
+    __syncthreads();
+  }
+}
+
 template <typename T>
 static int launch_top_k(void *stream, const void *data, void *values,
                         void *indices, const TopKGeom &geom, int largest,
@@ -160,7 +225,7 @@ static int launch_top_k(void *stream, const void *data, void *values,
   if (err != hipSuccess) {
     fprintf(stderr, "[custom_kernels] top_k_kernel launch failed: %s\n",
             hipGetErrorString(err));
-    return static_cast<int>(err);
+    return hipdnn_device_execution_status(static_cast<int>(err));
   }
   return 0;
 }
@@ -226,6 +291,23 @@ extern "C" int hip_top_k(void *stream, const void *data, void *values,
       (long long)geom.axis, (long long)geom.k, (long long)rank,
       (long long)geom.num_rows, (long long)geom.axis_size,
       element_size_bytes);
+
+  if (element_size_bytes == 4 && geom.axis == rank - 1 &&
+      geom.axis_size >= 256 && geom.k <= 32 &&
+      geom.num_rows > 0 && geom.num_rows <= INT32_MAX) {
+    (void)hipGetLastError();
+    hipLaunchKernelGGL(
+        top_k_last_axis_f32, dim3(static_cast<unsigned>(geom.num_rows)),
+        dim3(256), 0, static_cast<hipStream_t>(stream),
+        static_cast<const float *>(data), static_cast<float *>(values),
+        static_cast<int64_t *>(indices), geom, static_cast<int>(largest),
+        static_cast<int>(sorted));
+    const auto status = hipGetLastError();
+    if (status != hipSuccess)
+      fprintf(stderr, "[custom_kernels] parallel TopK launch failed: %s\n",
+              hipGetErrorString(status));
+    return hipdnn_device_execution_status(static_cast<int>(status));
+  }
 
   switch (element_size_bytes) {
   case 2:

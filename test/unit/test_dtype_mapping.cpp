@@ -19,6 +19,7 @@
 // build.
 
 #include "mlir-constants.hpp"
+#include "mlir-node-arg.hpp"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -35,6 +36,7 @@ enum : int {
   ONNX_INT16 = 5,
   ONNX_INT32 = 6,
   ONNX_FLOAT16 = 10,
+  ONNX_BFLOAT16 = 16,
 };
 
 namespace {
@@ -60,8 +62,20 @@ mlir::IntegerType asInt(mlir::Type elem) {
 int main() {
   mlir::MLIRContext ctx;
   mlir::OpBuilder builder(&ctx);
+  using morphizen::mlir_impl::mlirElementTypeToOnnxType;
   using morphizen::mlir_impl::onnxElementTypeToMlirDenseElementType;
   using morphizen::mlir_impl::onnxElementTypeToMlirElementType;
+
+  {
+    auto bf16 = onnxElementTypeToMlirElementType(ONNX_BFLOAT16, builder);
+    check(bf16.isBF16(), "elem(BFLOAT16) preserves bf16 rather than f32");
+    check(onnxElementTypeToMlirDenseElementType(ONNX_BFLOAT16, builder) == bf16,
+          "dense(BFLOAT16) preserves bf16 storage");
+    check(mlirElementTypeToOnnxType(builder.getBF16Type()) == ONNX_BFLOAT16,
+          "reverse BF16 mapping does not confuse it with FLOAT16");
+    check(mlirElementTypeToOnnxType(builder.getF16Type()) == ONNX_FLOAT16,
+          "reverse FLOAT16 mapping is unchanged");
+  }
 
   // --- The fix: inline UINT16 dense constant must stay UNSIGNED i16 ---------
   {

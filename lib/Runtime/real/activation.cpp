@@ -48,7 +48,7 @@ static int hipdnn_ep_to_hip_dtype_elementwise_unary(int64_t data_type) {
 // that kernel is column-wise over a GQA-specific layout AND its launcher
 // only spawns `total_head_queries` blocks, not `total_head_queries * cols`.
 // A standalone softmax wired to that path produces NaN downstream.
-// elem_size_bytes: 2 for fp16/bf16, 4 for fp32.  The lowering passes the
+// elem_size_bytes: 2 for fp16, 4 for fp32. The lowering passes the
 // element size derived from the MemRef type so the runtime can dispatch with
 // the correct dtype.
 extern "C" int hip_miopen_softmax(void *state, const void *input, void *output,
@@ -73,7 +73,7 @@ extern "C" int hip_miopen_softmax(void *state, const void *input, void *output,
             (long long)rows, (long long)cols);
     return -1;
   }
-  // Only fp16/bf16 (2 bytes) and fp32 (4 bytes) are supported.  Reject any
+  // Only fp16 (2 bytes) and fp32 (4 bytes) are supported. Reject any
   // other value immediately rather than silently producing wrong outputs.
   if (elem_size_bytes != 2 && elem_size_bytes != 4) {
     fprintf(stderr,

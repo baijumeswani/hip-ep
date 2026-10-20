@@ -61,6 +61,8 @@ struct TopKOpLowering : public ConvertOpToLLVMPattern<TopKOp> {
         extractContiguousMemRefPtr(adaptor.getIndices(), rewriter, loc);
 
     auto xType = cast<MemRefType>(op.getX().getType());
+    if (xType.getElementType().isBF16())
+      return op.emitOpError("BF16 TopK is not supported");
     int rank = xType.getRank();
     if (rank <= 0 || rank > 8)
       return rewriter.notifyMatchFailure(op, "rank must be in [1, 8]");

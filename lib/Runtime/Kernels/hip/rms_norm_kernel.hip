@@ -34,6 +34,7 @@
 #include "debug_log.h"
 
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -44,9 +45,15 @@ namespace {
 
 __device__ inline float rms_load(const float *p) { return *p; }
 __device__ inline float rms_load(const __half *p) { return __half2float(*p); }
+__device__ inline float rms_load(const __hip_bfloat16 *p) {
+  return static_cast<float>(*p);
+}
 
 __device__ inline void rms_store(float *p, float v) { *p = v; }
 __device__ inline void rms_store(__half *p, float v) { *p = __float2half(v); }
+__device__ inline void rms_store(__hip_bfloat16 *p, float v) {
+  *p = __hip_bfloat16(v);
+}
 
 // Block-wide sum. Every thread supplies a partial; every thread gets the total.
 __device__ inline float rms_block_sum(float partial, float *s_reduce) {
@@ -189,6 +196,14 @@ extern "C" int hip_rms_norm(void *stream, const void *input, const void *scale,
                          static_cast<__half *>(output), outer, norm_size,
                          scale_rows, epsilon);
     }
+  } else if (hip_dtype == HIP_DTYPE_BFLOAT16) {
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(hip_rms_norm_kernel<__hip_bfloat16, false>),
+        grid, block, 0, hip_stream,
+        static_cast<const __hip_bfloat16 *>(input),
+        static_cast<const __hip_bfloat16 *>(scale),
+        static_cast<__hip_bfloat16 *>(output), outer, norm_size, scale_rows,
+        epsilon);
   } else if (hip_dtype == HIP_DTYPE_FLOAT32) {
     hipLaunchKernelGGL(HIP_KERNEL_NAME(hip_rms_norm_kernel<float, false>), grid,
                        block, 0, hip_stream, static_cast<const float *>(input),
@@ -206,5 +221,5 @@ extern "C" int hip_rms_norm(void *stream, const void *input, const void *scale,
     fprintf(stderr, "[custom_kernels] hip_rms_norm launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }

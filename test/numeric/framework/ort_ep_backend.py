@@ -23,8 +23,33 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
+from ml_dtypes import bfloat16
+from onnx import TensorProto
 
 from .backend import Backend
+
+
+def ort_value_from_numpy(data: np.ndarray) -> ort.OrtValue:
+    """Keep native BF16 bits when NumPy transport has no matching ORT type."""
+    data = np.ascontiguousarray(data)
+    if data.dtype == np.dtype(bfloat16):
+        return ort.OrtValue.ortvalue_from_numpy_with_onnx_type(
+            data.view(np.uint16), TensorProto.BFLOAT16
+        )
+    return ort.OrtValue.ortvalue_from_numpy(data)
+
+
+def numpy_from_ort_value(value: ort.OrtValue) -> np.ndarray:
+    """Read native BF16 through the provider's ordinary typed copy contract."""
+    if value.element_type() != TensorProto.BFLOAT16:
+        return value.numpy()
+    storage = np.empty(value.shape(), dtype=np.uint16)
+    host = ort.OrtValue.ortvalue_from_numpy_with_onnx_type(
+        storage, TensorProto.BFLOAT16
+    )
+    host.update_inplace(value)
+    return storage.view(bfloat16)
+
 
 # Layering rule for this module:
 #

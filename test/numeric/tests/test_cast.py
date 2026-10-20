@@ -11,6 +11,7 @@ The Llama-3.1-8B model uses Cast i64 -> i32 in the attention mask subgraph.
 import numpy as np
 import pytest
 from onnx import TensorProto, helper
+from onnxruntime.capi.onnxruntime_pybind11_state import RuntimeException
 
 from framework.comparator import compare_outputs
 from framework.onnx_utils import (
@@ -32,6 +33,52 @@ def _make_cast_model(from_dtype, to_onnx_type: int, shape: list[int]):
 
 
 class TestCast:
+    def test_byte_mask_to_bfloat16(self, model_runner):
+        model = make_model_from_nodes(
+            [
+                helper.make_node("Cast", ["X"], ["bfloat"], to=TensorProto.BFLOAT16),
+                helper.make_node("Cast", ["bfloat"], ["Y"], to=TensorProto.FLOAT),
+            ],
+            [helper.make_tensor_value_info("X", TensorProto.UINT8, [513])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [513])],
+        )
+        values = (np.arange(513) % 256).astype(np.uint8)
+        actual, expected = model_runner.run_sample(model, [values], reference="cpu")
+        np.testing.assert_array_equal(actual[0], values.astype(np.float32))
+        np.testing.assert_array_equal(actual[0], expected[0])
+
+    @pytest.mark.parametrize("input_dtype", [np.float32, np.float16])
+    @pytest.mark.parametrize("output_dtype", [np.float32, np.float16])
+    def test_bfloat16_bridge(self, model_runner, input_dtype, output_dtype):
+        inputs = [
+            helper.make_tensor_value_info("X", np_to_onnx_type(input_dtype), [513])
+        ]
+        outputs = [
+            helper.make_tensor_value_info("Y", np_to_onnx_type(output_dtype), [513])
+        ]
+        model = make_model_from_nodes(
+            [
+                helper.make_node("Cast", ["X"], ["bfloat"], to=TensorProto.BFLOAT16),
+                helper.make_node(
+                    "Cast", ["bfloat"], ["Y"], to=np_to_onnx_type(output_dtype)
+                ),
+            ],
+            inputs,
+            outputs,
+        )
+        values = np.linspace(-63.9375, 63.9375, 513).astype(input_dtype)
+        actual, expected = model_runner.run_sample(model, [values], reference="cpu")
+        np.testing.assert_array_equal(actual[0], expected[0])
+
+    def test_unsupported_cast_reports_execution_failure(self, model_runner, request):
+        if request.config.getoption("--backend") != "ort_ep" or (
+            "profile=hip" not in request.config.getoption("--ep-option")
+        ):
+            pytest.skip("HIP execution-status contract through the AMDGPU wrapper")
+        model = _make_cast_model(np.float32, TensorProto.DOUBLE, [4])
+        with pytest.raises(RuntimeException, match="inference_compute.*failed"):
+            model_runner.run_sample(model, [np.arange(4, dtype=np.float32)])
+
     @pytest.mark.parametrize(
         "from_dtype,to_onnx_type,shape",
         [

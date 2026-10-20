@@ -5,6 +5,8 @@
 #ifndef HIPDNN_EP_ERRORS_H
 #define HIPDNN_EP_ERRORS_H
 
+#include "hip/execution_status_abi.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

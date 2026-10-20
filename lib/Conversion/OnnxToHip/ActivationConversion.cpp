@@ -29,6 +29,10 @@ SoftmaxToHip::matchAndRewrite(mlir::Operation *op,
 
   mlir::Location loc = op->getLoc();
   mlir::Value input = op->getOperand(0);
+  if (mlir::cast<mlir::RankedTensorType>(input.getType())
+          .getElementType()
+          .isBF16())
+    return op->emitOpError("BF16 standalone Softmax is not supported");
   auto resultType =
       mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType());
   mlir::Value init = createEmptyTensor(rewriter, loc, resultType, input);

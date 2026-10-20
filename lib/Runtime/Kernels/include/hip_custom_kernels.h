@@ -5,6 +5,8 @@
 #ifndef HIP_CUSTOM_KERNELS_H
 #define HIP_CUSTOM_KERNELS_H
 
+#include "hip/execution_status_abi.h"
+
 /*
  * Pure C interface for HIP custom kernels.
  *
@@ -58,6 +60,20 @@ HIP_KERNEL_API int hip_gated_delta_net(
     const float *past, const float *a_log, const float *dt_bias,
     void *output, float *present, int64_t tokens, int64_t batch,
     int64_t key_heads, int64_t value_heads, float scale, void *error_flag, int64_t input_dtype);
+HIP_KERNEL_API int hip_varlen_causal_conv_updates(
+    void *stream, const void *input, const void *weight,
+    const int32_t *cumulative, const void *bias, const void *past,
+    const int32_t *capture_count, void *output, void *present, void *updates,
+    int64_t tokens, int64_t batch, int64_t channels, int64_t capacity,
+    void *error_flag, int64_t input_dtype);
+HIP_KERNEL_API int hip_gated_delta_net_updates(
+    void *stream, const void *query, const void *key, const void *value,
+    const int32_t *cumulative, const float *decay, const float *beta,
+    const float *past, const float *a_log, const float *dt_bias,
+    const int32_t *capture_count, const int32_t *active,
+    void *output, float *present, float *updates, int64_t tokens, int64_t batch,
+    int64_t key_heads, int64_t value_heads, int64_t capacity, float scale,
+    void *error_flag, int64_t input_dtype);
 HIP_KERNEL_API int hip_gated_rms_norm(
     void *stream, const void *input, const void *weight, const void *gate,
     void *output, int64_t rows, int64_t width, float epsilon, void *error_flag,
@@ -978,6 +994,25 @@ HIP_KERNEL_API int hip_softplus(
  *
  * Returns: 0 on success, non-zero on error
  */
+HIP_KERNEL_API int hip_paged_attention_bf16(
+    void *stream, const void *query, void *key_cache, void *value_cache,
+    const int32_t *cumulative, const int32_t *past_lengths,
+    const int32_t *table, const void *cos_cache, const void *sin_cache,
+    const void *q_norm_weight, const void *k_norm_weight, void *query_scratch,
+    void *output, int tokens, int batch, int columns, int blocks, int page_size,
+    int heads, int kv_heads, int rotary_length, int window, float scale,
+    float epsilon, void *error_flag);
+
+HIP_KERNEL_API int hip_paged_attention_bf16_strided(
+    void *stream, const void *query, const void *key, const void *value,
+    void *key_cache, void *value_cache, const int32_t *cumulative,
+    const int32_t *past_lengths, const int32_t *table, const void *cos_cache,
+    const void *sin_cache, const void *q_norm_weight, const void *k_norm_weight,
+    void *query_scratch, void *output, int tokens, int batch, int columns,
+    int blocks, int page_size, int heads, int kv_heads, int query_stride,
+    int kv_stride, int rotary_length, int window, float scale, float epsilon,
+    void *error_flag);
+
 HIP_KERNEL_API int hip_paged_attention_fp16(
     void *stream, const void *query, void *key_cache, void *value_cache,
     const int32_t *cumulative_lengths, const int32_t *past_lengths,
@@ -2553,6 +2588,15 @@ HIP_KERNEL_API int hip_matmul_nbits_dequant_b_fp32(
  * (weights are constant) then run a hipBLASLt fp16 GEMM. scales_fp16 and
  * zeros_fp16 are fp16 [N, ceil(K/group_size)]; zeros_fp16 may be null (ONNX
  * 4-bit default zero-point 8). */
+/* Raw symmetric INT4/block-32, FP32 or BF16 activations/output/bias.
+ * Dtypes are HIP_DTYPE_*; scales may be FP16, BF16 or FP32. */
+HIP_KERNEL_API int hip_matmul_nbits_gemv_typed(
+    void *stream, const void *activations, const void *weights,
+    const void *scales, const void *bias, void *output, int m, int n, int k,
+    int activation_dtype, int scale_dtype);
+HIP_KERNEL_API int hip_matmul_nbits_dequant_b_typed(
+    void *stream, const void *weights, const void *scales, void *output,
+    int n, int k, int output_dtype, int scale_dtype);
 HIP_KERNEL_API void hip_matmul_nbits_dequant_b_fp16(
     void* stream, const void* B_packed, const void* scales_fp16,
     const void* zeros_fp16, void* B_fp16_out, int N, int K, int group_size);

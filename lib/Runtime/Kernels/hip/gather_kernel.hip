@@ -161,5 +161,5 @@ extern "C" int hip_gather(
             "[custom_kernels] hip_gather launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }

@@ -764,7 +764,7 @@ extern "C" int hip_elementwise_sigmoid(void *stream, const void *input,
             "[custom_kernels] hip_elementwise_sigmoid launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }
 
 __global__ void elementwise_tanh_f16_kernel(const __half *__restrict__ input,

@@ -19,6 +19,7 @@
 //   output:                              [num_rows, hidden_dim]
 
 #include "../debug_log.h"
+#include "../execution_status.h"
 #include "../hipdnn_ep_runtime.h"
 #include "../op_profile.h"
 #include "hip_custom_kernels.h"
@@ -31,7 +32,8 @@ int wrap_skip_simplified_layer_norm(RuntimeState *state, void *input,
                                     void *output, void *input_skip_bias_sum,
                                     int64_t input_num_elements,
                                     int64_t gamma_num_elements,
-                                    int64_t element_size_bytes, float epsilon) {
+                                    int64_t data_type, float epsilon) {
+  ExecutionStatusGuard execution_status(state);
   OP_PROFILE(
       "skip_layernorm",
       [&] {
@@ -58,15 +60,16 @@ int wrap_skip_simplified_layer_norm(RuntimeState *state, void *input,
   }
 
   int hip_dtype;
-  if (element_size_bytes == 2)
+  if (data_type == HIPDNN_EP_DATATYPE_HALF)
     hip_dtype = HIP_DTYPE_FLOAT16;
-  else if (element_size_bytes == 4)
+  else if (data_type == HIPDNN_EP_DATATYPE_FLOAT)
     hip_dtype = HIP_DTYPE_FLOAT32;
+  else if (data_type == HIPDNN_EP_DATATYPE_BFLOAT16)
+    hip_dtype = HIP_DTYPE_BFLOAT16;
   else {
     fprintf(stderr,
-            "wrap_skip_simplified_layer_norm: unsupported element_size %lld "
-            "(supported: 2=fp16, 4=fp32)\n",
-            (long long)element_size_bytes);
+            "wrap_skip_simplified_layer_norm: unsupported data_type %lld\n",
+            (long long)data_type);
     return -1;
   }
 
@@ -77,10 +80,10 @@ int wrap_skip_simplified_layer_norm(RuntimeState *state, void *input,
                     "hidden_dim=%lld, data_type=%s, epsilon=%e, "
                     "bias=%s, input_skip_bias_sum=%s\n",
                     (long long)num_rows, (long long)hidden_dim,
-                    (element_size_bytes == 2) ? "f16" : "f32", (double)epsilon,
+                    hipdnn_ep_datatype_name(data_type), (double)epsilon,
                     bias ? "yes" : "no", input_skip_bias_sum ? "yes" : "no");
 
-  return hip_skip_rms_norm(hipdnn_ep_state_get_stream(state), input, skip,
-                           gamma, bias, output, input_skip_bias_sum, num_rows,
-                           hidden_dim, epsilon, hip_dtype);
+  return execution_status.Finish(hip_skip_rms_norm(
+      hipdnn_ep_state_get_stream(state), input, skip, gamma, bias, output,
+      input_skip_bias_sum, num_rows, hidden_dim, epsilon, hip_dtype));
 }

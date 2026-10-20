@@ -421,6 +421,8 @@ bool hipdnn_ep_op_states_alloc(RuntimeState *state, int64_t n);
 void *hipdnn_ep_state_get_error_flag_device_ptr(RuntimeState *state);
 int hipdnn_ep_state_reset_error_flag(RuntimeState *state);
 int hipdnn_ep_state_read_and_clear_error_flag(RuntimeState *state);
+void hipdnn_ep_state_record_execution_status(RuntimeState *state, int status);
+int hipdnn_ep_state_get_execution_status(RuntimeState *state);
 // Mark the start of a new Compute() call. Invalidates per-forward-pass
 // runtime caches -- today: the GQA seqlens_k cache (see
 // runtime_state_internal.h for the canonical list).
@@ -834,7 +836,7 @@ int wrap_hipblasLtMatmul(
     int64_t N,              // Columns of B
     int64_t K,              // Columns of A / Rows of B
     int64_t batch_count,    // Number of batches
-    int64_t elem_size,      // Element size in bytes (2=f16, 4=f32)
+    int64_t data_type,      // HIPDNN_EP_DATATYPE_FLOAT/HALF/BFLOAT16
     int64_t b_batch_stride, // 0 = broadcast (any rank); K*N = per-batch
     int64_t transA,         // 1 = swap A's last two dims before multiply
     int64_t transB);        // 1 = swap B's last two dims before multiply
@@ -1444,6 +1446,24 @@ int wrap_gated_delta_net(RuntimeState *state, void *query, void *key,
                          int64_t batch, int64_t present_batch,
                          int64_t output_tokens, int64_t key_heads,
                          int64_t value_heads, float scale, int64_t input_dtype);
+int wrap_varlen_causal_conv_updates(
+    RuntimeState *state, void *input, void *weight, void *cumulative,
+    void *bias, void *past, void *capture_count, void *output, void *present,
+    void *updates, int64_t tokens, int64_t output_tokens,
+    int64_t cumulative_count, int64_t batch, int64_t present_batch,
+    int64_t channels, int64_t capture_batch, int64_t update_batch,
+    int64_t update_capacity, int64_t update_channels, int64_t capacity,
+    int64_t input_dtype);
+int wrap_gated_delta_net_updates(
+    RuntimeState *state, void *query, void *key, void *value, void *cumulative,
+    void *decay, void *beta, void *past, void *a_log, void *dt_bias,
+    void *capture_count, void *active, void *output, void *present,
+    void *updates, int64_t tokens, int64_t key_tokens, int64_t value_tokens,
+    int64_t decay_tokens, int64_t beta_tokens, int64_t cumulative_count,
+    int64_t batch, int64_t present_batch, int64_t output_tokens,
+    int64_t capture_batch, int64_t active_count, int64_t update_batch,
+    int64_t update_width, int64_t key_heads, int64_t value_heads,
+    int64_t capacity, float scale, int64_t input_dtype);
 int wrap_gated_rms_norm(RuntimeState *state, void *input, void *weight,
                         void *gate, void *output, int64_t rows,
                         int64_t gate_rows, int64_t output_rows, int64_t width,
@@ -1465,6 +1485,33 @@ int wrap_paged_attention(RuntimeState *state, void *query, void *past_key,
                          int64_t cumulative_count, int64_t table_rows,
                          int64_t value_blocks, int64_t value_block_size,
                          int64_t sin_length, float scale);
+
+int wrap_paged_attention_bf16(
+    RuntimeState *state, void *query, void *past_key, void *past_value,
+    void *cumulative, void *past_lengths, void *table, void *cos_cache,
+    void *sin_cache, void *q_norm_weight, void *k_norm_weight, void *output,
+    void *present_key, void *present_value, int64_t tokens,
+    int64_t output_tokens, int64_t batch, int64_t cumulative_count,
+    int64_t table_rows, int64_t table_columns, int64_t key_blocks,
+    int64_t key_page_size, int64_t value_blocks, int64_t value_page_size,
+    int64_t present_key_blocks, int64_t present_key_page_size,
+    int64_t present_value_blocks, int64_t present_value_page_size,
+    int64_t rotary_length, int64_t sin_length, int64_t heads, int64_t kv_heads,
+    int64_t local_window_size, float scale, float qk_norm_epsilon);
+
+int wrap_paged_attention_bf16_separate(
+    RuntimeState *state, void *query, void *key, void *value, void *past_key,
+    void *past_value, void *cumulative, void *past_lengths, void *table,
+    void *cos_cache, void *sin_cache, void *q_norm_weight, void *k_norm_weight,
+    void *output, void *present_key, void *present_value, int64_t tokens,
+    int64_t key_tokens, int64_t value_tokens, int64_t output_tokens,
+    int64_t batch, int64_t cumulative_count, int64_t table_rows,
+    int64_t table_columns, int64_t key_blocks, int64_t key_page_size,
+    int64_t value_blocks, int64_t value_page_size, int64_t present_key_blocks,
+    int64_t present_key_page_size, int64_t present_value_blocks,
+    int64_t present_value_page_size, int64_t rotary_length, int64_t sin_length,
+    int64_t heads, int64_t kv_heads, int64_t local_window_size, float scale,
+    float qk_norm_epsilon);
 
 int wrap_paged_attention_separate(
     RuntimeState *state, void *query, void *key, void *value, void *past_key,
@@ -1506,8 +1553,8 @@ int wrap_rotary_embedding(RuntimeState *state, void *input, void *position_ids,
 // scale_num_elements, which may cover several rows for a grouped norm.
 int wrap_rms_norm(RuntimeState *state, void *input, void *scale, void *output,
                   int64_t input_num_elements, int64_t scale_num_elements,
-                  int64_t norm_num_elements, int64_t element_size_bytes,
-                  int64_t axis, float epsilon, int64_t stash_type);
+                  int64_t norm_num_elements, int64_t data_type, int64_t axis,
+                  float epsilon, int64_t stash_type);
 
 // LayerNormalization operation wrapper (standard ONNX opset 17+)
 // bias, mean, inv_std may be nullptr when optional inputs/outputs are absent
@@ -1549,7 +1596,7 @@ int wrap_skip_simplified_layer_norm(RuntimeState *state, void *input,
                                     void *output, void *input_skip_bias_sum,
                                     int64_t input_num_elements,
                                     int64_t gamma_num_elements,
-                                    int64_t element_size_bytes, float epsilon);
+                                    int64_t data_type, float epsilon);
 
 // MatMulNBits operation wrapper (quantized N-bit matrix multiplication)
 // Dequantizes packed int4 weights and computes Y = A @ dequant(B)^T + bias
@@ -1572,9 +1619,9 @@ int wrap_matmul_nbits(
     int64_t batch_count,     // number of batches
     int64_t bits,            // quantization bits (e.g. 4)
     int64_t block_size,      // quantization block size
-    int64_t elem_size,       // element size in bytes
+    int64_t data_type,       // HIPDNN_EP_DATATYPE_* for activation/bias/output
     int64_t zp_elem_size,    // zero_points element size: 1=uint8 packed, 2=fp16
-    int64_t scale_elem_size); // scales element size in bytes: 2=fp16, 4=fp32
+    int64_t scale_data_type); // HIPDNN_EP_DATATYPE_* for scales
 
 // GatherBlockQuantized operation wrapper (com.microsoft).
 // Gather + block-wise dequantize: gather rows from `data` along

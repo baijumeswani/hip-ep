@@ -35,6 +35,7 @@
 #include "debug_log.h"
 
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -45,9 +46,15 @@ namespace {
 
 __device__ inline float skip_load(const float *p) { return *p; }
 __device__ inline float skip_load(const __half *p) { return __half2float(*p); }
+__device__ inline float skip_load(const __hip_bfloat16 *p) {
+  return static_cast<float>(*p);
+}
 
 __device__ inline void skip_store(float *p, float v) { *p = v; }
 __device__ inline void skip_store(__half *p, float v) { *p = __float2half(v); }
+__device__ inline void skip_store(__hip_bfloat16 *p, float v) {
+  *p = __hip_bfloat16(v);
+}
 
 __device__ inline float skip_block_sum(float partial, float *s_reduce) {
   s_reduce[threadIdx.x] = partial;
@@ -225,6 +232,17 @@ extern "C" int hip_skip_rms_norm(void *stream, const void *input,
           static_cast<__half *>(input_skip_bias_sum), outer, norm_size,
           epsilon);
     }
+  } else if (hip_dtype == HIP_DTYPE_BFLOAT16) {
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(hip_skip_rms_norm_kernel<__hip_bfloat16, false>),
+        grid, block, 0, hip_stream,
+        static_cast<const __hip_bfloat16 *>(input),
+        static_cast<const __hip_bfloat16 *>(skip),
+        static_cast<const __hip_bfloat16 *>(gamma),
+        static_cast<const __hip_bfloat16 *>(bias),
+        static_cast<__hip_bfloat16 *>(output),
+        static_cast<__hip_bfloat16 *>(input_skip_bias_sum), outer, norm_size,
+        epsilon);
   } else if (hip_dtype == HIP_DTYPE_FLOAT32) {
     hipLaunchKernelGGL(HIP_KERNEL_NAME(hip_skip_rms_norm_kernel<float, false>),
                        grid, block, 0, hip_stream,
@@ -247,5 +265,5 @@ extern "C" int hip_skip_rms_norm(void *stream, const void *input,
     fprintf(stderr, "[custom_kernels] hip_skip_rms_norm launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }

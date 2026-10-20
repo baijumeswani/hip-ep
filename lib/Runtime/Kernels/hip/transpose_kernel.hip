@@ -215,7 +215,7 @@ extern "C" int hip_transpose_2d_tiled(void* stream, const void* input,
         fprintf(stderr,
                 "[custom_kernels] hip_transpose_2d_tiled launch failed: %s\n",
                 hipGetErrorString(err));
-        return static_cast<int>(err);
+        return hipdnn_device_execution_status(static_cast<int>(err));
     }
     return 0;
 }
@@ -318,7 +318,7 @@ extern "C" int hip_transpose(void* stream,
         if (err != hipSuccess) {
             fprintf(stderr, "[custom_kernels] hip_transpose copy failed: %s\n",
                     hipGetErrorString(err));
-            return static_cast<int>(err);
+            return hipdnn_device_execution_status(static_cast<int>(err));
         }
         return 0;
     }
@@ -402,7 +402,7 @@ extern "C" int hip_transpose(void* stream,
             fprintf(stderr, "[custom_kernels] hip_transpose launch failed: %s\n",
                     hipGetErrorString(err));
         }
-        return static_cast<int>(err);
+        return hipdnn_device_execution_status(static_cast<int>(err));
     }
     constexpr int kBlockSize = 256;
     int64_t grid_size_i64 = (num_elements + kBlockSize - 1) / kBlockSize;
@@ -457,5 +457,5 @@ extern "C" int hip_transpose(void* stream,
         fprintf(stderr, "[custom_kernels] hip_transpose launch failed: %s\n",
                 hipGetErrorString(err));
     }
-    return static_cast<int>(err);
+    return hipdnn_device_execution_status(static_cast<int>(err));
 }

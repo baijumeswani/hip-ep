@@ -141,10 +141,18 @@ registerHipBufferizableOpInterfaceModels(DialectRegistry &registry) {
         HipDstBufferizableModel<PagedAttentionSeparateOp>>(*ctx);
     PagedAttentionInt8Op::attachInterface<
         HipDstBufferizableModel<PagedAttentionInt8Op>>(*ctx);
+    PagedAttentionBf16SeparateOp::attachInterface<
+        HipDstBufferizableModel<PagedAttentionBf16SeparateOp>>(*ctx);
+    PagedAttentionBf16Op::attachInterface<
+        HipDstBufferizableModel<PagedAttentionBf16Op>>(*ctx);
     VarlenCausalConvOp::attachInterface<
         HipDstBufferizableModel<VarlenCausalConvOp>>(*ctx);
     GatedDeltaNetOp::attachInterface<HipDstBufferizableModel<GatedDeltaNetOp>>(
         *ctx);
+    VarlenCausalConvUpdatesOp::attachInterface<
+        HipDstBufferizableModel<VarlenCausalConvUpdatesOp>>(*ctx);
+    GatedDeltaNetUpdatesOp::attachInterface<
+        HipDstBufferizableModel<GatedDeltaNetUpdatesOp>>(*ctx);
     GatedRmsNormOp::attachInterface<HipDstBufferizableModel<GatedRmsNormOp>>(
         *ctx);
     MRotaryEmbeddingOp::attachInterface<

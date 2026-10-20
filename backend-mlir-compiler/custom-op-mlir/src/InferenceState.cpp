@@ -6,12 +6,14 @@
 
 #include "LoadedArtifact.h"
 #include "hip/artifact_abi.h"
+#include "hip/execution_status_abi.h"
 #include "hip/timing.h"
 #include "morphizen/env_config.hpp"
 #include "morphizen/morphizen.hpp"
 #include <cstddef>
 #include <cstdlib>
 #include <glog/logging.h>
+#include <stdexcept>
 #include <utility>
 
 // Environment parameters (global scope, before namespace)
@@ -50,6 +52,8 @@ void InferenceState::resolveEntryPoints(const LoadedArtifact &artifact) {
       hipdnn::abi::kInferenceCompute);
   cleanup_fn_ =
       artifact.get_method<int, void *>(hipdnn::abi::kInferenceCleanup);
+  execution_status_fn_ =
+      artifact.get_method<int, void *>(hipdnn::abi::kRuntimeExecutionStatus);
   begin_compute_fn_ =
       artifact.get_method<void, void *>(hipdnn::abi::kRuntimeBeginCompute);
   set_output_allocator_fn_ =
@@ -67,9 +71,9 @@ void InferenceState::resolveEntryPoints(const LoadedArtifact &artifact) {
 InferenceState::InferenceState(PrivateTag, void *state,
                                std::unique_ptr<LoadedArtifact> artifact)
     : state_(state), artifact_(std::move(artifact)), compute_fn_(nullptr),
-      cleanup_fn_(nullptr), begin_compute_fn_(nullptr),
-      set_output_allocator_fn_(nullptr), flush_op_profile_fn_(nullptr),
-      add_cpu_profile_fn_(nullptr) {
+      cleanup_fn_(nullptr), execution_status_fn_(nullptr),
+      begin_compute_fn_(nullptr), set_output_allocator_fn_(nullptr),
+      flush_op_profile_fn_(nullptr), add_cpu_profile_fn_(nullptr) {
   resolveEntryPoints(*artifact_);
 
   MY_LOG(2) << "begin_compute symbol "
@@ -133,6 +137,9 @@ InferenceState::create(const std::vector<uint8_t> &artifact_bytes,
 
   // The inference_init lookup also triggers ORC's lazy codegen for the host
   // wrappers (LLVM IR), so this also covers first-symbol materialization.
+  if (!artifact->get_method<int, void *>(hipdnn::abi::kRuntimeExecutionStatus))
+    throw std::runtime_error(
+        "Model artifact lacks the HIP execution-status contract; rebuild it");
   void *state = runInit(*artifact, fs, config);
 
   TIMING_LOG("[Session] inference_init (lookup + lazy codegen): %.3fs\n",
@@ -173,6 +180,10 @@ int InferenceState::compute(span_t *inputs) const {
     return -1;
   }
   return compute_fn_(state_, inputs);
+}
+
+bool InferenceState::device_execution_failed() const {
+  return execution_status_fn_(state_) == HIPDNN_EP_ERR_DEVICE_EXECUTION_FAILED;
 }
 
 void InferenceState::set_output_allocator(

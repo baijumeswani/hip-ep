@@ -34,7 +34,7 @@ inline Value getNullableMemRefPtr(Value memref,
 // hip.rms_norm(%ctx) ins(%input, %scale) outs(%output)
 //   -> wrap_rms_norm(state, input, scale, output,
 //        input_num_elements, scale_num_elements, norm_num_elements,
-//        element_size_bytes, axis, epsilon, stash_type)
+//        data_type, axis, epsilon, stash_type)
 // Rank-generic. norm_num_elements is the ONNX reduction width -- the product
 // of the input dims from `axis` on -- so a 3D [B,S,D] input with axis = -1
 // normalizes B*S rows of width D. It has to be computed here, the only place
@@ -87,11 +87,17 @@ struct RmsNormOpLowering : public ConvertOpToLLVMPattern<RmsNormOp> {
           getMemRefDimSize(inputType, static_cast<unsigned>(dimIdx),
                            adaptor.getInput(), rewriter, loc));
 
-    // Compute element_size_bytes based on element type
     Type elementType = inputType.getElementType();
-    unsigned elementSizeBytes = elementType.getIntOrFloatBitWidth() / 8;
-    Value elementSizeBytesVal = LLVM::ConstantOp::create(
-        rewriter, loc, i64Type, rewriter.getI64IntegerAttr(elementSizeBytes));
+    if ((!elementType.isF16() && !elementType.isF32() &&
+         !elementType.isBF16()) ||
+        scaleType.getElementType() != elementType ||
+        cast<MemRefType>(op.getOutput().getType()).getElementType() !=
+            elementType)
+      return rewriter.notifyMatchFailure(op,
+                                         "rms_norm requires f16, bf16 or f32");
+    Value dataTypeVal = LLVM::ConstantOp::create(
+        rewriter, loc, i64Type,
+        rewriter.getI64IntegerAttr(getHipdnnDataType(elementType)));
 
     // Extract attributes
     Value axisVal = LLVM::ConstantOp::create(
@@ -106,7 +112,7 @@ struct RmsNormOpLowering : public ConvertOpToLLVMPattern<RmsNormOp> {
         ptrType,                   // state
         ptrType, ptrType, ptrType, // input, scale, output
         i64Type, i64Type,          // input_num_elements, scale_num_elements
-        i64Type, i64Type,          // norm_num_elements, element_size_bytes
+        i64Type, i64Type,          // norm_num_elements, data_type
         i64Type, f32Type, i64Type  // axis, epsilon, stash_type
     };
 
@@ -115,12 +121,10 @@ struct RmsNormOpLowering : public ConvertOpToLLVMPattern<RmsNormOp> {
     if (failed(funcOp))
       return failure();
 
-    SmallVector<Value> args = {statePtr,         inputPtr,
-                               scalePtr,         outputPtr,
-                               inputNumElements, scaleNumElements,
-                               normNumElements,  elementSizeBytesVal,
-                               axisVal,          epsilonVal,
-                               stashTypeVal};
+    SmallVector<Value> args = {
+        statePtr,         inputPtr,         scalePtr,        outputPtr,
+        inputNumElements, scaleNumElements, normNumElements, dataTypeVal,
+        axisVal,          epsilonVal,       stashTypeVal};
 
     LLVM::CallOp::create(rewriter, loc, *funcOp, args);
     rewriter.eraseOp(op);
@@ -169,11 +173,24 @@ struct SkipRmsNormOpLowering : public ConvertOpToLLVMPattern<SkipRmsNormOp> {
     Value gammaNumElements =
         computeNumElements(gammaType, adaptor.getGamma(), rewriter, loc);
 
-    // Compute element_size_bytes based on element type
     Type elementType = inputType.getElementType();
-    unsigned elementSizeBytes = elementType.getIntOrFloatBitWidth() / 8;
-    Value elementSizeBytesVal = LLVM::ConstantOp::create(
-        rewriter, loc, i64Type, rewriter.getI64IntegerAttr(elementSizeBytes));
+    if ((!elementType.isF16() && !elementType.isF32() &&
+         !elementType.isBF16()) ||
+        gammaType.getElementType() != elementType ||
+        cast<MemRefType>(op.getSkip().getType()).getElementType() !=
+            elementType ||
+        (op.getBias() &&
+         cast<MemRefType>(op.getBias().getType()).getElementType() !=
+             elementType))
+      return rewriter.notifyMatchFailure(
+          op, "skip_rms_norm requires matching f16, bf16 or f32 operands");
+    for (Value output : op.getOutputs())
+      if (cast<MemRefType>(output.getType()).getElementType() != elementType)
+        return rewriter.notifyMatchFailure(
+            op, "skip_rms_norm output dtype mismatch");
+    Value dataTypeVal = LLVM::ConstantOp::create(
+        rewriter, loc, i64Type,
+        rewriter.getI64IntegerAttr(getHipdnnDataType(elementType)));
 
     // Extract epsilon attribute
     Value epsilonVal =
@@ -190,7 +207,7 @@ struct SkipRmsNormOpLowering : public ConvertOpToLLVMPattern<SkipRmsNormOp> {
         ptrType, // input_skip_bias_sum (may be nullptr)
         i64Type, // input_num_elements
         i64Type, // gamma_num_elements
-        i64Type, // element_size_bytes
+        i64Type, // data_type
         f32Type  // epsilon
     };
 
@@ -200,12 +217,10 @@ struct SkipRmsNormOpLowering : public ConvertOpToLLVMPattern<SkipRmsNormOp> {
     if (failed(funcOp))
       return failure();
 
-    SmallVector<Value> args = {statePtr,         inputPtr,
-                               skipPtr,          gammaPtr,
-                               biasPtr,          outputPtr,
-                               skipOutputPtr,    inputNumElements,
-                               gammaNumElements, elementSizeBytesVal,
-                               epsilonVal};
+    SmallVector<Value> args = {
+        statePtr,         inputPtr,    skipPtr,       gammaPtr,
+        biasPtr,          outputPtr,   skipOutputPtr, inputNumElements,
+        gammaNumElements, dataTypeVal, epsilonVal};
 
     LLVM::CallOp::create(rewriter, loc, *funcOp, args);
     rewriter.eraseOp(op);
@@ -229,6 +244,8 @@ struct LayerNormOpLowering : public ConvertOpToLLVMPattern<LayerNormOp> {
   LogicalResult
   matchAndRewrite(LayerNormOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (cast<MemRefType>(op.getInput().getType()).getElementType().isBF16())
+      return op.emitOpError("BF16 LayerNormalization is not supported");
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
     Type ptrType = getPtrType();

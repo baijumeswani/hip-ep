@@ -373,8 +373,39 @@ void ConvertHipToLLVMPass::runOnOperation() {
     });
   }
 
-  if (failed(applyPartialConversion(module, target, std::move(patterns))))
+  if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
     signalPassFailure();
+    return;
+  }
+
+  SmallVector<LLVM::CallOp> runtimeCalls;
+  module.walk([&](LLVM::CallOp call) {
+    const auto callee = call.getCallee();
+    if (callee && callee->starts_with("wrap_") && call.getNumResults() == 1 &&
+        call.getResult().getType().isInteger(32) && call.getNumOperands() > 0 &&
+        isa<LLVM::LLVMPointerType>(call.getOperand(0).getType()))
+      runtimeCalls.push_back(call);
+  });
+  if (!runtimeCalls.empty()) {
+    OpBuilder builder(module.getContext());
+    for (auto call : runtimeCalls) {
+      auto scope = call->getParentOfType<ModuleOp>();
+      auto record = scope.lookupSymbol<LLVM::LLVMFuncOp>(
+          "hipdnn_ep_state_record_execution_status");
+      if (!record) {
+        builder.setInsertionPointToStart(scope.getBody());
+        record = LLVM::LLVMFuncOp::create(
+            builder, scope.getLoc(), "hipdnn_ep_state_record_execution_status",
+            LLVM::LLVMFunctionType::get(
+                LLVM::LLVMVoidType::get(module.getContext()),
+                {LLVM::LLVMPointerType::get(module.getContext()),
+                 builder.getI32Type()}));
+      }
+      builder.setInsertionPointAfter(call);
+      LLVM::CallOp::create(builder, call.getLoc(), record,
+                           ValueRange{call.getOperand(0), call.getResult()});
+    }
+  }
 
   if (failed(transformMainFunction(module)))
     signalPassFailure();

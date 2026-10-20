@@ -2,8 +2,8 @@
 Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 Licensed under the MIT License.
 -->
-# Compiler–Runtime Contract
 
+# Compiler–Runtime Contract
 **Date:** 2026-03-05
 **Document Type:** Design
 **Status:** Draft
@@ -291,8 +291,119 @@ are loaded without imposing a wider alignment requirement.
 
 The typed hybrid wrapper signatures were introduced in runtime ABI version 2.
 Runtime ABI version 3 adds session-owned paged-attention scratch and requires
-recompilation of older artifacts. These contracts establish supported
+recompilation of older artifacts. Runtime ABI version 4 replaces byte-width
+dispatch with explicit `HIPDNN_EP_DATATYPE_*` arguments for dense MatMul,
+RMS normalization and skip-RMS normalization. BF16 operands use native BF16
+storage and FP32 accumulation; descriptor caches distinguish BF16 from FP16.
+ONNX import and reverse type mapping preserve BF16 rather than promoting it to
+FP32 or confusing it with FP16. Native casts connect BF16 with FP16 and FP32.
+Cast and RMS wrapper failures set the session error flag even when generated
+graph calls discard the individual return value.
+Native BF16 Add/Mul perform FP32 arithmetic with BF16 output rounding and
+per-axis broadcasting, without FP16 reinterpretation. Byte-valued masks
+(including boolean storage) can be cast directly to BF16. Runtime Slice
+preserves BF16 bits for positive and negative steps. Elementwise and Slice
+wrappers also retain rejected contracts and launch failures in the session
+error flag; unsupported operations must not return an apparently successful
+graph with untouched outputs.
+Legacy byte-width arithmetic ABIs do not distinguish BF16 from FP16.
+LayerNormalization (including SkipLayerNormalization), standalone Softmax/RoPE, TopK, GQA,
+MultiHeadAttention, CausalConvWithState and QMoE therefore reject BF16 at
+lowering rather than reinterpret its bits. The explicitly typed RMS and
+windowed paged-attention operations below are separate supported contracts.
+ScatterElements permits BF16 bitwise assignment but rejects BF16 arithmetic
+reductions on its byte-width ABI.
+Runtime ABI version 5 replaces MatMulNBits activation and scale byte widths
+with explicit dtype arguments. Raw symmetric INT4/block-32 supports native
+BF16 activations, bias and output, with FP16, BF16 or FP32 scales. Small-M
+fused projection and bounded prefill expansion both round dequantized weights
+to BF16 before FP32 accumulation; neither reinterprets BF16 as FP16 or retains
+a model-wide expanded copy. Prefill scratch is bounded to at most 16384
+output channels, as on the FP32 path. BF16 zero points, group indices, other
+bit widths or block sizes, and CUDA-prepacked weights remain unsupported and
+are rejected. FP16 activations with BF16 scales are also rejected.
+Older artifacts must be recompiled, not passed through the typed ABI.
+These contracts establish supported
 computation, not full-model accuracy or a 24-GB residency guarantee.
+
+### Compact hybrid transition capture
+
+The existing convolution and Qwen gated-delta operators additionally support
+compact prefixes with capacity at most seven. Separate internal
+`hip.varlen_causal_conv_updates` and `hip.gated_delta_net_updates` operations
+preserve the capture-disabled wrapper ABI and compile out capture work on
+that path. FP16/FP32 activation contracts and FP32 recurrent arithmetic are
+unchanged; captured and capture-disabled full-step outputs must agree.
+
+Convolution returns raw input values `[batch,capacity,channels]`, with unused
+entries zeroed. Gated delta returns FP32
+`[batch,capacity*(value_heads + key_heads*128 + value_heads*128)]` rows:
+all decay factors first, then normalized keys, then per-value-row deltas.
+These are transitions, not full-state snapshots. Capture starts at each
+packed sequence's first token, including a verification anchor. Counts clamp
+to `[0,min(capacity,sequence_length)]`, matching the operator schema.
+
+The GDN `[1]` int32 activity input remains a host graph control; normal
+compiled-input staging uploads it before the kernel reads it. Zero disables
+capture and clears the capsule without changing full-step computation.
+While active, entries outside the captured prefix remain unspecified.
+Dynamic activity extents are checked before execution, and invalid packed
+lengths or dynamic extents prevent output/state mutation. Capture outputs
+cannot overlap inputs, full-step outputs or persistent state.
+Every retained prefix must reproduce an independent capture-disabled
+execution; committing all eight verification inputs uses the full staged
+state rather than asking a capacity-seven capsule to represent eight steps.
+
+### Compiled execution status
+
+Compiled wrapper return statuses are recorded after each call, including
+wrappers without a local guard. The session preserves host-contract rejection
+separately from explicitly tagged device execution API failures; later host
+errors cannot downgrade a device failure. Native argument checks are never
+classified from the sign or magnitude of a HIP error code.
+
+The bridge drains before exposing either error. Tagged device failures use
+`ORT_EP_FAIL`; host-contract errors retain `ORT_RUNTIME_EXCEPTION`. A failed
+drain remains fail-stop. Runtime ABI 6 artifacts must export the execution-status hook;
+older artifacts without it are rejected before runtime state allocation.
+
+### Cooperative vocabulary selection
+
+Wide FP32 last-axis TopK with K at most 32 uses one cooperative block per
+row instead of one serial thread per row. Selection preserves exact values,
+lower-index ties, smallest/largest modes and sorted output. Rows containing
+NaNs retain the legacy scan's ordering; other geometries and types retain
+their existing dispatch. Rejected contracts and launch failures are recorded
+in the session error flag.
+
+### BF16 windowed attention
+
+`hip.paged_attention_bf16` accepts packed native BF16 QKV, head size 128,
+BF16 per-head Q/K RMS weights and BF16 half-rotated RoPE tables. It implements
+noncausal query-block attention with a positive left window of at most 4096
+positions; the window includes the current position, while the block's future
+keys remain visible. `hip.paged_attention_bf16_separate` accepts separate
+BF16 Q, K and V matrices with the same semantics and uses their native row
+strides without allocating or copying a packed QKV tensor. Sinks, explicit
+slot mappings, quantization and interleaved/offset RoPE are rejected.
+
+Q/K RMS uses a widened reduction and normalization before rounding to BF16.
+This prevents FP32 rounding near BF16 halfway points from being amplified by
+cancellation in RoPE, and preserves BF16's exponent range when squaring.
+RoPE preserves BF16 intermediate rounding. Attention uses FP32 dot products
+and online softmax in fixed 128-key tiles, with native BF16 cache and output.
+Workspace contains only the packed normalized queries, not full-context
+expanded KV or a full score matrix.
+
+Validation completes before any cache mutation. Repeated read-only ring pages
+are valid; overlapping new writes and write/read aliases (including live
+history in the same request) are
+rejected. Only live window pages are inspected, and all positions still use
+their absolute RoPE indices. Past/present cache aliases and metadata extents
+are checked at runtime, including equal Q/K/V token extents for separate
+inputs before any mutation. Existing packed runtime entrypoints retain their
+signatures. This operator qualification does not enable the
+complete BF16 drafter or speculative Engine by itself.
 
 ### Static INT8 paged target attention
 

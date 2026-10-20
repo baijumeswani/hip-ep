@@ -516,6 +516,12 @@ struct LayerNormToHip : public mlir::RewritePattern {
 mlir::LogicalResult
 LayerNormToHip::matchAndRewrite(mlir::Operation *op,
                                 mlir::PatternRewriter &rewriter) const {
+  if (op->getNumOperands() > 0) {
+    auto type =
+        mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(0).getType());
+    if (type && type.getElementType().isBF16())
+      return op->emitOpError("BF16 LayerNormalization is not supported");
+  }
   auto ctxOrFailure = getContextArg(op, rewriter);
   if (mlir::failed(ctxOrFailure))
     return rewriter.notifyMatchFailure(op, "missing context argument");

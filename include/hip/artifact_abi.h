@@ -23,6 +23,10 @@ inline constexpr const char *kInferenceCleanup = "inference_cleanup";
 inline constexpr const char *kInferenceGetMetadataJson =
     "inference_get_metadata_json";
 
+// Required by runtime ABI 6 to distinguish device execution faults.
+inline constexpr const char *kRuntimeExecutionStatus =
+    "hipdnn_ep_state_get_execution_status";
+
 // Optional runtime hooks (consumers probe for these; absent on older
 // artifacts).
 inline constexpr const char *kRuntimeBeginCompute =

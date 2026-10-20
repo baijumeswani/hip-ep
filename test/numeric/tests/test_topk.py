@@ -10,9 +10,8 @@ the output extent (k) statically -- the runtime still reads k from the K
 buffer at run time (real/top_k.cpp does a D2H copy of k), so the GPU kernel is
 exercised. `largest` and `sorted` are both covered.
 
-Inputs use DISTINCT per-row values (no ties), so the selected set and its
-sorted order -- and therefore the returned indices -- are unambiguous and can
-be compared bit-exact against the ORT CPU reference (atol=0).
+Covers small and vocabulary-sized axes, lower-index ties, infinities and
+legacy NaN ordering. Finite selections compare bit-exactly with ORT CPU.
 """
 
 from __future__ import annotations
@@ -59,6 +58,85 @@ def _distinct_rows(rng, rows: int, cols: int) -> np.ndarray:
 
 
 class TestTopK:
+    @pytest.mark.parametrize("largest", [0, 1])
+    def test_wide_nan_preserves_legacy_scan(self, model_runner, largest):
+        values = np.tile(np.arange(257, dtype=np.float32), (2, 1))
+        values[0, 0] = values[1, 1] = np.nan
+        model = _make_topk_model([2, 257], 3, axis=1, largest=largest, sorted_=1)
+        chosen = np.array(
+            [[0, 256, 255], [256, 255, 254]] if largest else [[0, 1, 2], [0, 1, 2]],
+            dtype=np.int64,
+        )
+        expected_values = np.take_along_axis(values, chosen, axis=1)
+        reference = make_model_from_nodes(
+            [
+                helper.make_node("Identity", ["ref_values"], ["values"]),
+                helper.make_node("Identity", ["ref_indices"], ["indices"]),
+            ],
+            list(model.graph.input),
+            list(model.graph.output),
+            initializers=[
+                numpy_helper.from_array(expected_values, "ref_values"),
+                numpy_helper.from_array(chosen, "ref_indices"),
+            ],
+        )
+        actual, expected = model_runner.run_sample(
+            model, [values], reference="cpu", reference_model=reference
+        )
+        for output, legacy in zip(actual, expected):
+            np.testing.assert_array_equal(output, legacy)
+
+    @pytest.mark.parametrize("largest", [0, 1])
+    @pytest.mark.parametrize("sorted_", [0, 1])
+    @pytest.mark.parametrize("shape,k", [([7, 248320], 16), ([2, 3, 513], 32)])
+    def test_wide_last_axis(self, model_runner, largest, sorted_, shape, k):
+        model = _make_topk_model(shape, k, axis=-1, largest=largest, sorted_=sorted_)
+        rng = np.random.default_rng(942)
+        values = rng.integers(-100, 101, shape).astype(np.float32)
+        values[..., 0] = -np.inf
+        values[..., -1] = np.inf
+        actual, expected = model_runner.run_sample(model, [values], reference="cpu")
+        if not sorted_:
+            np.testing.assert_array_equal(
+                np.sort(actual[1], axis=-1), np.sort(expected[1], axis=-1)
+            )
+            np.testing.assert_array_equal(
+                actual[0], np.take_along_axis(values, actual[1], axis=-1)
+            )
+            return
+        for output, reference in zip(actual, expected):
+            np.testing.assert_array_equal(output, reference)
+
+    @pytest.mark.parametrize("largest", [0, 1])
+    def test_wide_equal_values_prefer_lower_indices(self, model_runner, largest):
+        model = _make_topk_model([3, 257], 16, axis=1, largest=largest, sorted_=1)
+        values = np.zeros((3, 257), dtype=np.float32)
+        values[0, ::2] = -0.0
+        values[1] = -np.inf
+        values[2] = np.inf
+        actual, expected = model_runner.run_sample(model, [values], reference="cpu")
+        np.testing.assert_array_equal(actual[1], np.tile(np.arange(16), (3, 1)))
+        for output, reference in zip(actual, expected):
+            np.testing.assert_array_equal(output, reference)
+        np.testing.assert_array_equal(
+            actual[0].view(np.uint32), expected[0].view(np.uint32)
+        )
+
+    @pytest.mark.parametrize("largest", [0, 1])
+    def test_non_last_axis(self, model_runner, largest):
+        model = _make_topk_model([3, 4, 9], 3, axis=1, largest=largest, sorted_=1)
+        values = np.random.default_rng(942).normal(size=(3, 4, 9)).astype(np.float32)
+        actual, expected = model_runner.run_sample(model, [values], reference="cpu")
+        for output, reference in zip(actual, expected):
+            np.testing.assert_array_equal(output, reference)
+
+    def test_rejected_selection_fails_inference(self, model_runner):
+        from onnxruntime.capi.onnxruntime_pybind11_state import RuntimeException
+
+        model = _make_topk_model([2, 300], 257, axis=1, largest=1, sorted_=1)
+        with pytest.raises(RuntimeException, match="inference_compute"):
+            model_runner.run_sample(model, [np.zeros((2, 300), dtype=np.float32)])
+
     @pytest.mark.parametrize("largest", [1, 0])
     @pytest.mark.parametrize("sorted_", [1])
     def test_topk_axis1(self, model_runner, largest, sorted_):

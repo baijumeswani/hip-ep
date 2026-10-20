@@ -76,11 +76,16 @@ struct QwenHybridToHip : RewritePattern {
     SmallVector<unsigned> anchors;
     SmallVector<NamedAttribute> attributes;
     StringRef target;
+    const int64_t updateCapacity = integer("state_update_capacity", 0);
+    if (updateCapacity < 0 || updateCapacity > 7)
+      return reject("compact state_update_capacity must be in [0,7]");
+    const bool capture = updateCapacity != 0;
 
     if (kind == "VarlenCausalConvWithState") {
-      if (op->getNumOperands() != 5 || op->getNumResults() != 2)
-        return reject("requires five inputs and two outputs; state windows "
-                      "are not supported");
+      if (op->getNumOperands() != (capture ? 6u : 5u) ||
+          op->getNumResults() != (capture ? 3u : 2u))
+        return reject("requires five inputs/two outputs, or capture_count and "
+                      "a third output with positive compact capacity");
       auto x = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
       if (!x || x.getRank() != 2 || x.getDimSize(1) <= 0)
         return reject("requires a statically known channel count");
@@ -99,17 +104,31 @@ struct QwenHybridToHip : RewritePattern {
             "int32 cumulative lengths and three-element carry");
       target = "hip.varlen_causal_conv";
       anchors = {0, 4};
+      if (capture) {
+        if (!tensorMatches(op->getOperand(5), i32, {-1}) ||
+            !tensorMatches(op->getResult(2), activationType,
+                           {-1, updateCapacity, channels}))
+          return reject("compact convolution requires int32 [batch] capture "
+                        "counts and matching [batch,capacity,channels] values");
+        target = "hip.varlen_causal_conv_updates";
+        anchors.push_back(4);
+        attributes.push_back(
+            rewriter.getNamedAttr("state_update_capacity",
+                                  rewriter.getI64IntegerAttr(updateCapacity)));
+      }
     } else if (kind == "GatedDeltaNet") {
-      if (op->getNumOperands() != 9 || op->getNumResults() != 2)
-        return reject("requires nine inputs and two outputs; state windows "
-                      "are not supported");
+      if (op->getNumOperands() != (capture ? 11u : 9u) ||
+          op->getNumResults() != (capture ? 3u : 2u))
+        return reject(
+            "requires nine inputs/two outputs, or capture_count, "
+            "state_update_active and a third output with positive capacity");
       auto q = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
       auto v = dyn_cast<RankedTensorType>(op->getOperand(2).getType());
       if (!q || !v || q.getRank() != 3 || v.getRank() != 3)
         return reject("requires rank-three packed Q/K/V");
       const int64_t kh = q.getDimSize(1), vh = v.getDimSize(1);
       const double scale = floating("scale", 0);
-      if (kh <= 0 || vh <= 0 || kh > vh || vh % kh != 0 ||
+      if (kh <= 0 || vh <= 0 || vh > 65535 || kh > vh || vh % kh != 0 ||
           !std::isfinite(scale) || scale < 0 ||
           !tensorMatches(op->getOperand(0), activationType, {-1, kh, 128}) ||
           !tensorMatches(op->getOperand(1), activationType, {-1, kh, 128}) ||
@@ -137,6 +156,26 @@ struct QwenHybridToHip : RewritePattern {
           rewriter.getNamedAttr(
               "scale", rewriter.getF32FloatAttr(
                            scale == 0 ? 1.0 / std::sqrt(128.0) : scale))};
+      if (capture) {
+        const int64_t capsuleWidth =
+            updateCapacity * (vh + kh * 128 + vh * 128);
+        auto activity =
+            dyn_cast<RankedTensorType>(op->getOperand(10).getType());
+        const bool activityMatches =
+            activity && activity.getElementType() == i32 &&
+            activity.getRank() == 1 &&
+            (activity.isDynamicDim(0) || activity.getDimSize(0) == 1);
+        if (!tensorMatches(op->getOperand(9), i32, {-1}) || !activityMatches ||
+            !tensorMatches(op->getResult(2), f32, {-1, capsuleWidth}))
+          return reject(
+              "compact recurrence requires int32 [batch] counts, "
+              "int32 [1] activity and FP32 [batch,capsule_width] output");
+        target = "hip.gated_delta_net_updates";
+        anchors.push_back(6);
+        attributes.push_back(
+            rewriter.getNamedAttr("state_update_capacity",
+                                  rewriter.getI64IntegerAttr(updateCapacity)));
+      }
     } else if (kind == "GatedRMSNorm") {
       if (op->getNumOperands() != 3 || op->getNumResults() != 1)
         return reject("requires input, scale, gate and one output");

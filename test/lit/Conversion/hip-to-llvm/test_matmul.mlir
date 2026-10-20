@@ -27,7 +27,7 @@ module {
 // CHECK: llvm.call @wrap_hipblasLtMatmul({{.*}}) : (!llvm.ptr, i32, !llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, i64, i64, i64, i64, i64) -> i32
 // Verify 11 parameters:
 // - 4 pointers: state, A, B, output
-// - 6 i64: M=128, N=1024, K=4096, batch_count=1, elem_size=2, b_batch_stride=0
+// - 6 i64: M=128, N=1024, K=4096, batch_count=1, data_type=1, b_batch_stride=0
 //   (B is rank-2 [K, N] = broadcast weight → stride = 0, compile-time const)
 // - 1 i32: op_state_slot (-1 here — --assign-op-state-slots not run in this RUN)
 
@@ -73,3 +73,19 @@ module {
 // CHECK-LABEL: llvm.func @test_matmul_trans_b
 // CHECK: llvm.mlir.constant(1 : i64)
 // CHECK: llvm.call @wrap_hipblasLtMatmul({{.*}}) : (!llvm.ptr, i32, !llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, i64, i64, i64, i64, i64) -> i32
+
+module {
+  func.func @test_matmul_bf16(%ctx: !hip.context,
+                            %a: memref<8x128xbf16, 1>,
+                            %b: memref<128x64xbf16, 1>,
+                            %output: memref<8x64xbf16, 1>) {
+    hip.matmul(%ctx)
+        ins(%a, %b : memref<8x128xbf16, 1>, memref<128x64xbf16, 1>)
+        outs(%output : memref<8x64xbf16, 1>)
+    return
+  }
+}
+
+// CHECK-LABEL: llvm.func @test_matmul_bf16
+// CHECK: %[[BF16:.*]] = llvm.mlir.constant(2 : i64)
+// CHECK: llvm.call @wrap_hipblasLtMatmul({{.*}}, %[[BF16]], %{{[^,]+}}, %{{[^,]+}}, %{{[^)]+}})

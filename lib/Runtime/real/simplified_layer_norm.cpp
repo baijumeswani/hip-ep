@@ -20,6 +20,7 @@
 // shared by all rows in the ordinary case, one per group for a grouped norm.
 
 #include "../debug_log.h"
+#include "../execution_status.h"
 #include "../hipdnn_ep_runtime.h"
 #include "../op_profile.h"
 #include "hip_custom_kernels.h"
@@ -29,8 +30,9 @@
 
 int wrap_rms_norm(RuntimeState *state, void *input, void *scale, void *output,
                   int64_t input_num_elements, int64_t scale_num_elements,
-                  int64_t norm_num_elements, int64_t element_size_bytes,
-                  int64_t axis, float epsilon, int64_t stash_type) {
+                  int64_t norm_num_elements, int64_t data_type, int64_t axis,
+                  float epsilon, int64_t stash_type) {
+  ExecutionStatusGuard execution_status(state);
   OP_PROFILE(
       "layernorm",
       [&] {
@@ -90,15 +92,15 @@ int wrap_rms_norm(RuntimeState *state, void *input, void *scale, void *output,
   }
 
   int hip_dtype;
-  if (element_size_bytes == 2)
+  if (data_type == HIPDNN_EP_DATATYPE_HALF)
     hip_dtype = HIP_DTYPE_FLOAT16;
-  else if (element_size_bytes == 4)
+  else if (data_type == HIPDNN_EP_DATATYPE_FLOAT)
     hip_dtype = HIP_DTYPE_FLOAT32;
+  else if (data_type == HIPDNN_EP_DATATYPE_BFLOAT16)
+    hip_dtype = HIP_DTYPE_BFLOAT16;
   else {
-    fprintf(stderr,
-            "wrap_rms_norm: unsupported element_size %lld "
-            "(supported: 2=fp16, 4=fp32)\n",
-            (long long)element_size_bytes);
+    fprintf(stderr, "wrap_rms_norm: unsupported data_type %lld\n",
+            (long long)data_type);
     return -1;
   }
 
@@ -106,14 +108,15 @@ int wrap_rms_norm(RuntimeState *state, void *input, void *scale, void *output,
   const int64_t num_rows = input_num_elements / norm_size;
   const int64_t scale_rows = scale_num_elements / norm_size;
 
-  RUNTIME_DEBUG_LOG("[REAL] wrap_rms_norm: num_rows=%lld, norm_size=%lld, "
-                    "scale_rows=%lld, data_type=%s, epsilon=%e, "
-                    "total_bytes=%lld\n",
-                    (long long)num_rows, (long long)norm_size,
-                    (long long)scale_rows,
-                    (element_size_bytes == 2) ? "f16" : "f32", (double)epsilon,
-                    (long long)(input_num_elements * element_size_bytes));
+  RUNTIME_DEBUG_LOG(
+      "[REAL] wrap_rms_norm: num_rows=%lld, norm_size=%lld, "
+      "scale_rows=%lld, data_type=%s, epsilon=%e, "
+      "total_bytes=%lld\n",
+      (long long)num_rows, (long long)norm_size, (long long)scale_rows,
+      hipdnn_ep_datatype_name(data_type), (double)epsilon,
+      (long long)(input_num_elements * hipdnn_ep_datatype_size(data_type)));
 
-  return hip_rms_norm(hipdnn_ep_state_get_stream(state), input, scale, output,
-                      num_rows, norm_size, scale_rows, epsilon, hip_dtype);
+  return execution_status.Finish(
+      hip_rms_norm(hipdnn_ep_state_get_stream(state), input, scale, output,
+                   num_rows, norm_size, scale_rows, epsilon, hip_dtype));
 }

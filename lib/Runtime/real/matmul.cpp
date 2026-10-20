@@ -24,7 +24,7 @@
 //===----------------------------------------------------------------------===//
 // Per-shape descriptor cache with multi-algorithm auto-tune.
 //
-// On the first call for each unique (M, N, K, batch, elem_size) shape we
+// On the first call for each unique (M, N, K, batch, data_type) shape we
 // create descriptors, request up to MAX_ALGO_CANDIDATES algorithms from the
 // heuristic, and store them. On the first actual matmul call (when real GPU
 // pointers are available), we benchmark each candidate and cache the winner.
@@ -45,10 +45,10 @@ static bool autotune_enabled() {
 }
 
 struct MatmulCacheKey {
-  int64_t M, N, K, batch_count, elem_size, b_batch_stride, transA, transB;
+  int64_t M, N, K, batch_count, data_type, b_batch_stride, transA, transB;
   bool operator==(const MatmulCacheKey &o) const {
     return M == o.M && N == o.N && K == o.K && batch_count == o.batch_count &&
-           elem_size == o.elem_size && b_batch_stride == o.b_batch_stride &&
+           data_type == o.data_type && b_batch_stride == o.b_batch_stride &&
            transA == o.transA && transB == o.transB;
   }
 };
@@ -60,7 +60,7 @@ struct MatmulCacheKeyHash {
     hash_combine_val(h, k.N);
     hash_combine_val(h, k.K);
     hash_combine_val(h, k.batch_count);
-    hash_combine_val(h, k.elem_size);
+    hash_combine_val(h, k.data_type);
     hash_combine_val(h, k.b_batch_stride);
     hash_combine_val(h, k.transA);
     hash_combine_val(h, k.transB);
@@ -69,7 +69,7 @@ struct MatmulCacheKeyHash {
 };
 
 /// Cached hipBLASLt descriptors + multi-algorithm auto-tune state for a
-/// single (M, N, K, batch, elem_size) shape. Descriptors are created in
+/// single (M, N, K, batch, data_type) shape. Descriptors are created in
 /// queryOrCreateMatmul() and owned by the MatmulAlgoTable, which frees them
 /// when the last session sharing it is destroyed.
 struct MatmulCacheEntry {
@@ -152,7 +152,9 @@ static MatmulCacheEntry *queryOrCreateMatmul(MatmulAlgoTable &table,
   if (it != table.map.end())
     return it->second.get();
 
-  hipDataType dt = (key.elem_size == 2) ? HIP_R_16F : HIP_R_32F;
+  hipDataType dt = key.data_type == HIPDNN_EP_DATATYPE_HALF       ? HIP_R_16F
+                   : key.data_type == HIPDNN_EP_DATATYPE_BFLOAT16 ? HIP_R_16BF
+                                                                  : HIP_R_32F;
   int64_t M = key.M, N = key.N, K = key.K;
   int64_t transA = key.transA;
   int64_t transB = key.transB;
@@ -452,7 +454,7 @@ static void autotuneMatmul(hipblasLtHandle_t handle, hipStream_t stream,
 
 int wrap_hipblasLtMatmul(RuntimeState *state, int op_state_slot, const void *A,
                          const void *B, void *output, int64_t M, int64_t N,
-                         int64_t K, int64_t batch_count, int64_t elem_size,
+                         int64_t K, int64_t batch_count, int64_t data_type,
                          int64_t b_batch_stride, int64_t transA,
                          int64_t transB) {
   ExecutionStatusGuard execution_status(state);
@@ -480,13 +482,16 @@ int wrap_hipblasLtMatmul(RuntimeState *state, int op_state_slot, const void *A,
     return -1;
   }
 
-  if (elem_size != 2 && elem_size != 4) {
-    fprintf(stderr, "wrap_hipblasLtMatmul: unsupported elem_size %lld\n",
-            (long long)elem_size);
+  if (data_type != HIPDNN_EP_DATATYPE_HALF &&
+      data_type != HIPDNN_EP_DATATYPE_FLOAT &&
+      data_type != HIPDNN_EP_DATATYPE_BFLOAT16) {
+    fprintf(stderr, "wrap_hipblasLtMatmul: unsupported data_type %lld\n",
+            (long long)data_type);
     return -1;
   }
 
-  const char *type_name = (elem_size == 2) ? "f16" : "f32";
+  const int64_t elem_size = hipdnn_ep_datatype_size(data_type);
+  const char *type_name = hipdnn_ep_datatype_name(data_type);
   RUNTIME_DEBUG_LOG("[REAL] wrap_hipblasLtMatmul: M=%lld, N=%lld, K=%lld, "
                     "batch=%lld, b_batch_stride=%lld, transA=%lld, "
                     "transB=%lld, elem_size=%lld (%s), total_bytes=%lld\n",
@@ -502,7 +507,7 @@ int wrap_hipblasLtMatmul(RuntimeState *state, int op_state_slot, const void *A,
     return -1;
   }
 
-  MatmulCacheKey key{M,      N,     K, batch_count, elem_size, b_batch_stride,
+  MatmulCacheKey key{M,      N,     K, batch_count, data_type, b_batch_stride,
                      transA, transB};
   MatmulCacheEntry *cached = queryOrCreateMatmul(*ms->table, handle, key);
   if (!cached) {
@@ -561,7 +566,9 @@ int wrap_hipblasLtMatmul(RuntimeState *state, int op_state_slot, const void *A,
 
   if (st != HIPBLAS_STATUS_SUCCESS) {
     fprintf(stderr, "wrap_hipblasLtMatmul: hipblasLtMatmul failed (%d)\n", st);
-    return -1;
+    return execution_status.Finish(st == HIPBLAS_STATUS_EXECUTION_FAILED
+                                       ? HIPDNN_EP_ERR_DEVICE_EXECUTION_FAILED
+                                       : -1);
   }
 
   RUNTIME_DEBUG_LOG("[REAL] wrap_hipblasLtMatmul: completed successfully\n");

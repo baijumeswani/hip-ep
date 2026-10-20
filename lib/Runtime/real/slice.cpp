@@ -35,6 +35,7 @@
 // dtype for these operands today).
 
 #include "../debug_log.h"
+#include "../execution_status.h"
 #include "../hipdnn_ep_runtime.h"
 #include "../op_profile.h"
 #include "hip_custom_kernels.h"
@@ -51,6 +52,8 @@ static int slice_hipdnn_to_hip_dtype(int64_t hipdnn_type) {
   switch (hipdnn_type) {
   case HIPDNN_EP_DATATYPE_HALF:
     return HIP_DTYPE_FLOAT16;
+  case HIPDNN_EP_DATATYPE_BFLOAT16:
+    return HIP_DTYPE_BFLOAT16;
   case HIPDNN_EP_DATATYPE_FLOAT:
     return HIP_DTYPE_FLOAT32;
   case HIPDNN_EP_DATATYPE_INT32:
@@ -62,12 +65,12 @@ static int slice_hipdnn_to_hip_dtype(int64_t hipdnn_type) {
   }
 }
 
-int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
-               void *axes, void *steps, void *output, const int64_t *data_shape,
-               int64_t data_rank, const int64_t *output_shape,
-               int64_t output_rank, int64_t starts_num_elements,
-               int64_t axes_num_elements, int64_t steps_num_elements,
-               int64_t data_type) {
+static int RunSlice(RuntimeState *state, void *data, void *starts, void *ends,
+                    void *axes, void *steps, void *output,
+                    const int64_t *data_shape, int64_t data_rank,
+                    const int64_t *output_shape, int64_t output_rank,
+                    int64_t starts_num_elements, int64_t axes_num_elements,
+                    int64_t steps_num_elements, int64_t data_type) {
   // (Slice runtime entry trace removed; was used for the slice-empty-buffer
   // root-cause investigation. Re-add with a HIPDNN_EP_DEBUG gate if needed.)
   OP_PROFILE(
@@ -152,7 +155,7 @@ int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
   if (hip_dtype < 0) {
     fprintf(stderr,
             "[REAL] wrap_slice: unsupported data_type=%s(%lld) "
-            "(supported: f16, f32, i32, i64)\n",
+            "(supported: f16, bf16, f32, i32, i64)\n",
             hipdnn_ep_datatype_name(data_type), (long long)data_type);
     return -1;
   }
@@ -385,4 +388,17 @@ int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
   return hip_slice(hipdnn_ep_state_get_stream(state), data, output, data_shape,
                    output_shape, logical_extent, start_per_axis, step_per_axis,
                    static_cast<int>(data_rank), hip_dtype);
+}
+
+int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
+               void *axes, void *steps, void *output, const int64_t *data_shape,
+               int64_t data_rank, const int64_t *output_shape,
+               int64_t output_rank, int64_t starts_num_elements,
+               int64_t axes_num_elements, int64_t steps_num_elements,
+               int64_t data_type) {
+  ExecutionStatusGuard execution_status(state);
+  return execution_status.Finish(
+      RunSlice(state, data, starts, ends, axes, steps, output, data_shape,
+               data_rank, output_shape, output_rank, starts_num_elements,
+               axes_num_elements, steps_num_elements, data_type));
 }

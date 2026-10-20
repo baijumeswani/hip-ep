@@ -17,7 +17,8 @@ module {
         outs(%values, %indices : memref<3x2xf32, 1>, memref<3x2xi64, 1>)
         {axis = 1 : i64, largest = true, sorted = true}
 
-    // CHECK: llvm.call @wrap_top_k({{.*}}) : (!llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, i64, !llvm.ptr, i64, i64) -> i32
+    // CHECK: %[[STATUS:.*]] = llvm.call @wrap_top_k({{.*}}) : (!llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, i64, !llvm.ptr, i64, i64) -> i32
+    // CHECK-NEXT: llvm.call @hipdnn_ep_state_record_execution_status(%{{.*}}, %[[STATUS]]) : (!llvm.ptr, i32) -> ()
     return
   }
 

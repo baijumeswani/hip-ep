@@ -21,7 +21,7 @@ data dtype set is:
     Expand    : f16, f32, i32, i64
     Pad       : f16, f32, i32, i64       (modes: constant, reflect, edge, wrap)
     GatherND  : f16, f32, i32, i64       (indices: int64 only)
-    Slice     : f16, f32, i32, i64       (starts/ends/axes/steps: int64 only)
+    Slice     : f16, bf16, f32, i32, i64 (starts/ends/axes/steps: int64 only)
     ScatterND : f16, f32, i32, i64       (indices: int64 only;
                                           reductions: none, add, mul, min, max)
 """
@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from ml_dtypes import bfloat16
 from onnx import TensorProto, helper, numpy_helper
+from onnxruntime.capi.onnxruntime_pybind11_state import RuntimeException
 
 from framework.comparator import compare_outputs
 from framework.onnx_utils import make_model_from_nodes, np_to_onnx_type
@@ -461,6 +463,55 @@ def _make_slice_model(
 
 
 class TestSlice:
+    @pytest.mark.parametrize("step", [1, -1])
+    def test_bfloat16_runtime(self, model_runner, step):
+        starts, ends = ([2], [6]) if step == 1 else ([5], [1])
+        model, _ = _make_slice_model(
+            np.float32, [8, 6], starts, ends, [0], [step], [4, 6], False
+        )
+        reference = make_model_from_nodes(
+            list(model.graph.node), list(model.graph.input), list(model.graph.output)
+        )
+        model.graph.node[0].input[0] = "bfloat_input"
+        model.graph.node[0].output[0] = "bfloat_output"
+        model.graph.node.insert(
+            0,
+            helper.make_node("Cast", ["X"], ["bfloat_input"], to=TensorProto.BFLOAT16),
+        )
+        model.graph.node.append(
+            helper.make_node("Cast", ["bfloat_output"], ["Y"], to=TensorProto.FLOAT)
+        )
+        data = (np.arange(48, dtype=np.float32).reshape(8, 6) - 24) * 1e20
+        # Inputs are already representable in BF16; slicing must only move bits.
+        data = data.astype(bfloat16).astype(np.float32)
+        feeds = [
+            data,
+            np.array(starts, dtype=np.int64),
+            np.array(ends, dtype=np.int64),
+            np.array([0], dtype=np.int64),
+            np.array([step], dtype=np.int64),
+        ]
+        actual, expected = model_runner.run_sample(
+            model, feeds, reference="cpu", reference_model=reference
+        )
+        np.testing.assert_array_equal(actual[0], expected[0])
+
+    def test_unsupported_slice_reports_execution_failure(self, model_runner, request):
+        if request.config.getoption("--backend") != "ort_ep" or (
+            "profile=hip" not in request.config.getoption("--ep-option")
+        ):
+            pytest.skip("HIP execution-status contract through the AMDGPU wrapper")
+        model, _ = _make_slice_model(np.float64, [8], [2], [6], [0], [1], [4], False)
+        feeds = [
+            np.arange(8, dtype=np.float64),
+            np.array([2], dtype=np.int64),
+            np.array([6], dtype=np.int64),
+            np.array([0], dtype=np.int64),
+            np.array([1], dtype=np.int64),
+        ]
+        with pytest.raises(RuntimeException, match="inference_compute.*failed"):
+            model_runner.run_sample(model, feeds)
+
     @pytest.mark.parametrize(
         "dtype,shape,starts,ends,axes,steps,out_shape",
         [

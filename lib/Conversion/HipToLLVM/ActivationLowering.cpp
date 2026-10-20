@@ -562,6 +562,8 @@ struct MiopenSoftmaxOpLowering
   LogicalResult
   matchAndRewrite(MiopenSoftmaxOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (cast<MemRefType>(op.getInput().getType()).getElementType().isBF16())
+      return op.emitOpError("BF16 standalone Softmax is not supported");
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
     Type voidType = getVoidType();
@@ -587,18 +589,18 @@ struct MiopenSoftmaxOpLowering
                                  inputDesc.size(rewriter, loc, i));
 
     // Determine element size in bytes from the MemRef element type.
-    // Only fp16/bf16 (2 bytes) and fp32 (4 bytes) are supported by the
+    // Only fp16 (2 bytes) and fp32 (4 bytes) are supported by the
     // runtime kernels.  Unsupported types are rejected here at compile time
     // rather than silently producing wrong outputs at runtime.
     Type elemType = inputMemrefType.getElementType();
     int64_t elemSizeBytes;
-    if (elemType.isF16() || elemType.isBF16())
+    if (elemType.isF16())
       elemSizeBytes = 2;
     else if (elemType.isF32())
       elemSizeBytes = 4;
     else
       return op.emitOpError("hip_miopen_softmax: unsupported element type; "
-                            "only fp16/bf16/fp32 are supported");
+                            "only fp16/fp32 are supported");
     Value elemSize = LLVM::ConstantOp::create(
         rewriter, loc, indexType,
         rewriter.getIntegerAttr(indexType, elemSizeBytes));

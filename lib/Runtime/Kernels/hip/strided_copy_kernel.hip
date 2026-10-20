@@ -130,5 +130,5 @@ extern "C" int hip_strided_copy(void *stream, void *dst, const void *src,
     fprintf(stderr, "[custom_kernels] hip_strided_copy launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return (int)err;
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }

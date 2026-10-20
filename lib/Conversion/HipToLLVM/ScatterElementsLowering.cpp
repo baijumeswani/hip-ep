@@ -51,6 +51,10 @@ struct ScatterElementsOpLowering
   LogicalResult
   matchAndRewrite(ScatterElementsOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (cast<MemRefType>(op.getData().getType()).getElementType().isBF16() &&
+        op.getReduction() != "none")
+      return op.emitOpError(
+          "BF16 ScatterElements reductions are not supported");
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
     Type ptrType = getPtrType();

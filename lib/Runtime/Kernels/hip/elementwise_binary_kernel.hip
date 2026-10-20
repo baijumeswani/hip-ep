@@ -25,6 +25,7 @@
 
 #include <cmath>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -225,7 +226,7 @@ extern "C" int hip_elementwise_equal(void *stream, const void *lhs,
             "[custom_kernels] hip_elementwise_equal launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }
 
 // =====================================================================
@@ -323,7 +324,7 @@ extern "C" int hip_elementwise_less(void *stream, const void *lhs,
             "[custom_kernels] hip_elementwise_less launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }
 
 // =====================================================================
@@ -461,7 +462,7 @@ extern "C" int hip_elementwise_mod(void *stream, const void *lhs,
             "[custom_kernels] hip_elementwise_mod launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }
 
 // =====================================================================
@@ -512,7 +513,7 @@ extern "C" int hip_elementwise_or(void *stream, const void *lhs,
             "[custom_kernels] hip_elementwise_or launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }
 
 // =====================================================================
@@ -563,7 +564,7 @@ extern "C" int hip_elementwise_and(void *stream, const void *lhs,
             "[custom_kernels] hip_elementwise_and launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }
 
 // =====================================================================
@@ -675,7 +676,7 @@ extern "C" int hip_elementwise_mul(void *stream, const void *lhs,
             hip_dtype);
     return -1;
   }
-  return static_cast<int>(hipGetLastError());
+  return hipdnn_device_execution_status(static_cast<int>(hipGetLastError()));
 }
 
 extern "C" int hip_elementwise_add(void *stream, const void *lhs,
@@ -728,7 +729,7 @@ extern "C" int hip_elementwise_add(void *stream, const void *lhs,
             hip_dtype);
     return -1;
   }
-  return static_cast<int>(hipGetLastError());
+  return hipdnn_device_execution_status(static_cast<int>(hipGetLastError()));
 }
 
 // =====================================================================
@@ -842,7 +843,7 @@ extern "C" int hip_elementwise_min(void *stream, const void *lhs,
             hip_dtype);
     return -1;
   }
-  return static_cast<int>(hipGetLastError());
+  return hipdnn_device_execution_status(static_cast<int>(hipGetLastError()));
 }
 
 extern "C" int hip_elementwise_max(void *stream, const void *lhs,
@@ -888,7 +889,7 @@ extern "C" int hip_elementwise_max(void *stream, const void *lhs,
             hip_dtype);
     return -1;
   }
-  return static_cast<int>(hipGetLastError());
+  return hipdnn_device_execution_status(static_cast<int>(hipGetLastError()));
 }
 
 // =====================================================================
@@ -917,11 +918,17 @@ __device__ __forceinline__ float ew_load(const float *p, uint32_t i) {
 __device__ __forceinline__ float ew_load(const __half *p, uint32_t i) {
   return __half2float(p[i]);
 }
+__device__ __forceinline__ float ew_load(const __hip_bfloat16 *p, uint32_t i) {
+  return static_cast<float>(p[i]);
+}
 __device__ __forceinline__ void ew_store(float *p, uint32_t i, float v) {
   p[i] = v;
 }
 __device__ __forceinline__ void ew_store(__half *p, uint32_t i, float v) {
   p[i] = __float2half(v);
+}
+__device__ __forceinline__ void ew_store(__hip_bfloat16 *p, uint32_t i, float v) {
+  p[i] = __hip_bfloat16(v);
 }
 
 __device__ __forceinline__ float ew_to_float(float v) { return v; }
@@ -1277,10 +1284,29 @@ extern "C" int hip_elementwise_binary_bcast(void *stream, const void *lhs,
               "[custom_kernels] hip_elementwise_binary_bcast fast path launch "
               "failed: %s\n",
               hipGetErrorString(ferr));
-    return static_cast<int>(ferr);
+    return hipdnn_device_execution_status(static_cast<int>(ferr));
   }
 
   switch (hip_dtype) {
+  case HIP_DTYPE_BFLOAT16:
+    if (op != 0 && op != 1) {
+      fprintf(stderr,
+              "[custom_kernels] BF16 broadcasting supports only Add/Mul\n");
+      return -1;
+    }
+    if (flat)
+      hipLaunchKernelGGL(ew_flat_kernel<__hip_bfloat16>, dim3(grid_size),
+                         dim3(kBlockSize), 0, hip_stream,
+                         static_cast<const __hip_bfloat16 *>(lhs),
+                         static_cast<const __hip_bfloat16 *>(rhs),
+                         static_cast<__hip_bfloat16 *>(output), n, op);
+    else
+      hipLaunchKernelGGL(ew_bcast4d_kernel<__hip_bfloat16>, dim3(grid_size),
+                         dim3(kBlockSize), 0, hip_stream,
+                         static_cast<const __hip_bfloat16 *>(lhs),
+                         static_cast<const __hip_bfloat16 *>(rhs),
+                         static_cast<__hip_bfloat16 *>(output), n, op, meta);
+    break;
   case HIP_DTYPE_FLOAT16:
     if (flat)
       hipLaunchKernelGGL(ew_flat_kernel<__half>, dim3(grid_size),
@@ -1323,7 +1349,7 @@ extern "C" int hip_elementwise_binary_bcast(void *stream, const void *lhs,
             "[custom_kernels] hip_elementwise_binary_bcast launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }
 
 extern "C" int hip_elementwise_div(void *stream, const void *lhs,
@@ -1391,5 +1417,5 @@ extern "C" int hip_elementwise_div(void *stream, const void *lhs,
             "[custom_kernels] hip_elementwise_div launch failed: %s\n",
             hipGetErrorString(err));
   }
-  return static_cast<int>(err);
+  return hipdnn_device_execution_status(static_cast<int>(err));
 }

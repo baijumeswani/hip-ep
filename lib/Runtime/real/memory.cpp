@@ -38,7 +38,7 @@ int wrap_hipMemcpyAsync(RuntimeState *state, void *dst_ptr, const void *src_ptr,
   if (err != hipSuccess) {
     fprintf(stderr, "wrap_hipMemcpyAsync: copy failed (%zu bytes): %s\n",
             size_bytes, hipGetErrorString(err));
-    return -1;
+    return hipdnn_device_execution_status(err);
   }
 
   return 0;
@@ -84,7 +84,7 @@ int wrap_hipMemcpy2DAsync(RuntimeState *state, void *dst_ptr, size_t dst_pitch,
     fprintf(stderr,
             "wrap_hipMemcpy2DAsync: copy failed (width=%zu height=%zu): %s\n",
             width, height, hipGetErrorString(err));
-    return -1;
+    return hipdnn_device_execution_status(err);
   }
 
   return 0;
@@ -102,8 +102,8 @@ int wrap_hipMemcpy2DAsync(RuntimeState *state, void *dst_ptr, size_t dst_pitch,
 // Maps the 2D pitched geometry onto hip_strided_copy's rank-1 outer form:
 //   outer_sizes = {height}, src/dst outer strides = {pitch_elems},
 //   row_elems   = contiguous inner suffix length (stride 1 on both sides).
-// On any kernel failure (unsupported element size, launch error) falls back to
-// hipMemcpy2DAsync so correctness never depends on the kernel succeeding.
+// Unsupported layouts fall back to hipMemcpy2DAsync. Device execution failures
+// propagate instead of being hidden by a second copy.
 int wrap_strided_copy(RuntimeState *state, void *dst_ptr, const void *src_ptr,
                       int64_t elem_bytes, int64_t height,
                       int64_t src_pitch_elems, int64_t dst_pitch_elems,
@@ -149,6 +149,8 @@ int wrap_strided_copy(RuntimeState *state, void *dst_ptr, const void *src_ptr,
 
   if (rc == 0)
     return 0;
+  if (rc == HIPDNN_EP_ERR_DEVICE_EXECUTION_FAILED)
+    return rc;
 
   // Kernel could not handle this copy (e.g. odd element size) -- fall back to
   // the correct (if slower) pitched DMA path.
@@ -164,7 +166,7 @@ int wrap_strided_copy(RuntimeState *state, void *dst_ptr, const void *src_ptr,
   if (err != hipSuccess) {
     fprintf(stderr, "wrap_strided_copy: fallback 2D copy failed: %s\n",
             hipGetErrorString(err));
-    return -1;
+    return hipdnn_device_execution_status(err);
   }
   return 0;
 }
@@ -172,8 +174,8 @@ int wrap_strided_copy(RuntimeState *state, void *dst_ptr, const void *src_ptr,
 // Synchronize the stream, then read back a device-resident i32 scalar (e.g.
 // NonZero's non-zero count). The copy is enqueued after the producing kernel
 // on the same stream; the synchronize guarantees both have completed before
-// the host value is read. Returns 0 on any failure (a zero extent is a safe,
-// inert dynamic dim).
+// the host value is read. Failures record an inference error before returning
+// a zero extent to the remaining shape computation.
 int32_t hipdnn_ep_readback_i32(RuntimeState *state, const void *device_scalar) {
   // CPU-only profiling: this call issues a hipStreamSynchronize, so its cost is
   // host-side wait time (GPU drain), invisible to GPU per-op events. Surfacing
@@ -183,6 +185,7 @@ int32_t hipdnn_ep_readback_i32(RuntimeState *state, const void *device_scalar) {
   OP_PROFILE_CPU("readback_i32", state);
   if (!state || !device_scalar) {
     fprintf(stderr, "hipdnn_ep_readback_i32: null argument\n");
+    hipdnn_ep_state_record_execution_status(state, -1);
     return 0;
   }
   hipStream_t stream =
@@ -196,12 +199,16 @@ int32_t hipdnn_ep_readback_i32(RuntimeState *state, const void *device_scalar) {
   if (err != hipSuccess) {
     fprintf(stderr, "hipdnn_ep_readback_i32: D2H copy failed: %s\n",
             hipGetErrorString(err));
+    hipdnn_ep_state_record_execution_status(
+        state, hipdnn_device_execution_status(err));
     return 0;
   }
   err = hipStreamSynchronize(stream);
   if (err != hipSuccess) {
     fprintf(stderr, "hipdnn_ep_readback_i32: stream sync failed: %s\n",
             hipGetErrorString(err));
+    hipdnn_ep_state_record_execution_status(
+        state, hipdnn_device_execution_status(err));
     return 0;
   }
   return host_val;
@@ -226,6 +233,7 @@ void hipdnn_ep_readback_scalar(RuntimeState *state, void *host_dst,
   OP_PROFILE_CPU("readback_scalar", state);
   if (!state || !host_dst || !device_scalar || num_bytes <= 0) {
     fprintf(stderr, "hipdnn_ep_readback_scalar: invalid argument\n");
+    hipdnn_ep_state_record_execution_status(state, -1);
     return;
   }
   hipStream_t stream =
@@ -240,12 +248,16 @@ void hipdnn_ep_readback_scalar(RuntimeState *state, void *host_dst,
   if (err != hipSuccess) {
     fprintf(stderr, "hipdnn_ep_readback_scalar: D2H copy failed: %s\n",
             hipGetErrorString(err));
+    hipdnn_ep_state_record_execution_status(
+        state, hipdnn_device_execution_status(err));
     return;
   }
   err = hipStreamSynchronize(stream);
   if (err != hipSuccess) {
     fprintf(stderr, "hipdnn_ep_readback_scalar: stream sync failed: %s\n",
             hipGetErrorString(err));
+    hipdnn_ep_state_record_execution_status(
+        state, hipdnn_device_execution_status(err));
   }
 }
 
@@ -270,7 +282,7 @@ int wrap_copy_d2h(RuntimeState *state, void *dst_ptr, const void *src_ptr,
   if (err != hipSuccess) {
     fprintf(stderr, "wrap_copy_d2h: D2H copy failed (%lld bytes): %s\n",
             static_cast<long long>(size_bytes), hipGetErrorString(err));
-    return -1;
+    return hipdnn_device_execution_status(err);
   }
   return 0;
 }

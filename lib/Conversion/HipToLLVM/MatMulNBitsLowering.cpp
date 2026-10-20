@@ -44,7 +44,18 @@ struct MatMulNBitsOpLowering : public ConvertOpToLLVMPattern<MatMulNBitsOp> {
 
     auto AType = cast<MemRefType>(op.getA().getType());
     int64_t ARank = AType.getRank();
-    int64_t elemSize = AType.getElementType().getIntOrFloatBitWidth() / 8;
+    Type activationType = AType.getElementType();
+    if (!activationType.isF16() && !activationType.isF32() &&
+        !activationType.isBF16())
+      return rewriter.notifyMatchFailure(
+          op, "unsupported MatMulNBits activation dtype");
+    if (cast<MemRefType>(op.getOutput().getType()).getElementType() !=
+            activationType ||
+        (op.getBias() &&
+         cast<MemRefType>(op.getBias().getType()).getElementType() !=
+             activationType))
+      return rewriter.notifyMatchFailure(
+          op, "MatMulNBits activation, bias and output dtype mismatch");
 
     // A shape: [..., M, K] — M is the second-to-last dim
     Value m = (ARank >= 2) ? getMemRefDimSize(AType, ARank - 2, adaptor.getA(),
@@ -62,9 +73,15 @@ struct MatMulNBitsOpLowering : public ConvertOpToLLVMPattern<MatMulNBitsOp> {
     Value k = createI64Const(op.getK());
     Value bits = createI64Const(op.getBits());
     Value blockSize = createI64Const(op.getBlockSize());
-    Value elemSizeVal = createI64Const(elemSize);
+    Value dataTypeVal = createI64Const(getHipdnnDataType(activationType));
     Value zpElemSizeVal = createI64Const(op.getZpElemSize());
-    Value scaleElemSizeVal = createI64Const(op.getScaleElemSize());
+    auto scalesType =
+        cast<MemRefType>(op.getScales().getType()).getElementType();
+    if ((!scalesType.isF16() && !scalesType.isBF16() && !scalesType.isF32()) ||
+        getHipdnnDataType(scalesType) != op.getScaleDataType())
+      return rewriter.notifyMatchFailure(op,
+                                         "MatMulNBits scale dtype mismatch");
+    Value scaleDataTypeVal = createI64Const(op.getScaleDataType());
 
     SmallVector<Type, 18> paramTypes = {
         ptrType, // state
@@ -82,9 +99,9 @@ struct MatMulNBitsOpLowering : public ConvertOpToLLVMPattern<MatMulNBitsOp> {
         i64Type, // batch_count
         i64Type, // bits
         i64Type, // block_size
-        i64Type, // elem_size
+        i64Type, // data_type
         i64Type, // zp_elem_size
-        i64Type  // scale_elem_size
+        i64Type  // scale_data_type
     };
 
     FailureOr<LLVM::LLVMFuncOp> funcOp = LLVM::lookupOrCreateFn(
@@ -108,9 +125,9 @@ struct MatMulNBitsOpLowering : public ConvertOpToLLVMPattern<MatMulNBitsOp> {
                                    batch,
                                    bits,
                                    blockSize,
-                                   elemSizeVal,
+                                   dataTypeVal,
                                    zpElemSizeVal,
-                                   scaleElemSizeVal};
+                                   scaleDataTypeVal};
 
     LLVM::CallOp::create(rewriter, loc, *funcOp, args);
     rewriter.eraseOp(op);

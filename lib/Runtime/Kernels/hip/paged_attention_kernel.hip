@@ -6,6 +6,7 @@
 #include "hip_custom_kernels.h"
 
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -118,6 +119,203 @@ __device__ int RequestForToken(const int32_t *cumulative, int token, int batch) 
   while (request + 1 < batch && token >= cumulative[request + 1])
     ++request;
   return request;
+}
+
+__global__ void ValidateWindowed(
+    const int32_t *cumulative, const int32_t *past, const int32_t *table,
+    int tokens, int batch, int columns, int blocks, int page_size,
+    int rotary_length, int window, int *error) {
+  const int request = blockIdx.x;
+  const int start = cumulative[request];
+  const int end = cumulative[request + 1];
+  const int prefix = past[request];
+  if (cumulative[0] != 0 || cumulative[batch] != tokens || start < 0 ||
+      end <= start || end > tokens || prefix < 0 ||
+      end - start > INT_MAX - prefix) {
+    if (threadIdx.x == 0)
+      atomicExch(error, -1);
+    return;
+  }
+  const int total = prefix + end - start;
+  if (total > rotary_length ||
+      total > static_cast<int64_t>(columns) * page_size) {
+    if (threadIdx.x == 0)
+      atomicExch(error, -1);
+    return;
+  }
+  const int first = max(0, prefix - (window - 1));
+  const int last_page = (total - 1) / page_size;
+  for (int page = first / page_size + threadIdx.x; page <= last_page;
+       page += blockDim.x) {
+    const int physical = table[static_cast<int64_t>(request) * columns + page];
+    if (physical < 0 || physical >= blocks) {
+      atomicExch(error, -1);
+      continue;
+    }
+    const int write_begin = max(0, prefix - page * page_size);
+    const int write_end = min(page_size, total - page * page_size);
+    if (write_begin >= write_end)
+      continue;
+    // Read-only aliases and disjoint ring offsets are valid, but writes must
+    // not overwrite another logical page's live history, even in this request.
+    for (int other = 0; other < batch; ++other) {
+      const int other_start = cumulative[other];
+      const int other_end = cumulative[other + 1];
+      const int other_prefix = past[other];
+      if (other_start < 0 || other_end <= other_start || other_end > tokens ||
+          other_prefix < 0 || other_end - other_start > INT_MAX - other_prefix)
+        continue;
+      const int other_total = other_prefix + other_end - other_start;
+      if (other_total > static_cast<int64_t>(columns) * page_size)
+        continue;
+      const int other_first = max(0, other_prefix - (window - 1));
+      for (int other_page = other_first / page_size;
+           other_page <= (other_total - 1) / page_size; ++other_page) {
+        if (other == request && other_page == page)
+          continue;
+        const int read_begin = max(0, other_first - other_page * page_size);
+        const int read_end = min(page_size, other_total - other_page * page_size);
+        if (physical == table[static_cast<int64_t>(other) * columns + other_page] &&
+            write_begin < read_end && read_begin < write_end)
+          atomicExch(error, -1);
+      }
+    }
+  }
+}
+
+__global__ void PrepareBf16(
+    const __hip_bfloat16 *input_query, const __hip_bfloat16 *input_key,
+    const __hip_bfloat16 *input_value, __hip_bfloat16 *key_cache,
+    __hip_bfloat16 *value_cache, const int32_t *cumulative,
+    const int32_t *past, const int32_t *table,
+    const __hip_bfloat16 *cos_cache, const __hip_bfloat16 *sin_cache,
+    const __hip_bfloat16 *q_norm_weight, const __hip_bfloat16 *k_norm_weight,
+    __hip_bfloat16 *query, int batch, int columns, int page_size, int heads,
+    int kv_heads, int query_stride, int kv_stride, float epsilon,
+    const int *error) {
+  if (*error)
+    return;
+  // Stabilize BF16 rounding before RoPE combines potentially cancelling lanes.
+  __shared__ double reduction[128];
+  __shared__ __hip_bfloat16 normalized[128];
+  const int token = blockIdx.x;
+  const int head = blockIdx.y;
+  const int dimension = threadIdx.x;
+  const bool is_query = head < heads;
+  const int request = RequestForToken(cumulative, token, batch);
+  const int position = past[request] + (token - cumulative[request]);
+  const int source_head = is_query ? head : head - heads;
+  const auto *source = is_query ? input_query : input_key;
+  const int64_t row = static_cast<int64_t>(token) *
+                      (is_query ? query_stride : kv_stride);
+  const double value = static_cast<float>(source[row + source_head * 128 + dimension]);
+  reduction[dimension] = value * value;
+  __syncthreads();
+  for (int width = 64; width; width /= 2) {
+    if (dimension < width)
+      reduction[dimension] += reduction[dimension + width];
+    __syncthreads();
+  }
+  const auto *weight = is_query ? q_norm_weight : k_norm_weight;
+  normalized[dimension] = __hip_bfloat16(static_cast<float>(
+      value / sqrt(reduction[0] / 128.0 + static_cast<double>(epsilon)) *
+      static_cast<double>(static_cast<float>(weight[dimension]))));
+  __syncthreads();
+  const int64_t rotary = static_cast<int64_t>(position) * 64 + dimension % 64;
+  const float first = static_cast<float>(__hip_bfloat16(
+      static_cast<float>(normalized[dimension]) * static_cast<float>(cos_cache[rotary])));
+  const float second = static_cast<float>(__hip_bfloat16(
+      static_cast<float>(normalized[(dimension + 64) % 128]) *
+      static_cast<float>(sin_cache[rotary])));
+  const __hip_bfloat16 rotated(first + (dimension < 64 ? -second : second));
+  if (is_query) {
+    query[(static_cast<int64_t>(token) * heads + head) * 128 + dimension] = rotated;
+  } else {
+    const int kv_head = head - heads;
+    const int physical = table[static_cast<int64_t>(request) * columns + position / page_size];
+    const int64_t slot =
+        ((static_cast<int64_t>(physical) * page_size + position % page_size) *
+         kv_heads + kv_head) * 128 + dimension;
+    key_cache[slot] = rotated;
+    value_cache[slot] = input_value[
+        static_cast<int64_t>(token) * kv_stride + kv_head * 128 + dimension];
+  }
+}
+
+__global__ void AttendBf16(
+    const __hip_bfloat16 *query, const __hip_bfloat16 *key_cache,
+    const __hip_bfloat16 *value_cache, const int32_t *cumulative,
+    const int32_t *past, const int32_t *table, __hip_bfloat16 *output,
+    int batch, int columns, int page_size, int heads, int kv_heads, int window,
+    float scale, const int *error) {
+  if (*error)
+    return;
+  __shared__ float q[128];
+  __shared__ float weights[128];
+  __shared__ float reduction[128];
+  const int token = blockIdx.x;
+  const int head = blockIdx.y;
+  const int dimension = threadIdx.x;
+  const int request = RequestForToken(cumulative, token, batch);
+  const int position = past[request] + (token - cumulative[request]);
+  const int first = max(0, position - (window - 1));
+  const int end = past[request] + (cumulative[request + 1] - cumulative[request]);
+  const int kv_head = head / (heads / kv_heads);
+  q[dimension] =
+      static_cast<float>(query[(static_cast<int64_t>(token) * heads + head) * 128 + dimension]);
+  __syncthreads();
+  float maximum = -INFINITY;
+  float sum = 0;
+  float accumulator = 0;
+  for (int begin = first; begin < end;) {
+    const int count = min(128, end - begin);
+    float score = -INFINITY;
+    if (dimension < count) {
+      const int key_position = begin + dimension;
+      const int physical = table[static_cast<int64_t>(request) * columns + key_position / page_size];
+      const int64_t slot =
+          ((static_cast<int64_t>(physical) * page_size + key_position % page_size) *
+           kv_heads + kv_head) * 128;
+      float dot = 0;
+      for (int d = 0; d < 128; ++d)
+        dot = fmaf(q[d], static_cast<float>(key_cache[slot + d]), dot);
+      score = dot * scale;
+    }
+    reduction[dimension] = score;
+    __syncthreads();
+    for (int width = 64; width; width /= 2) {
+      if (dimension < width)
+        reduction[dimension] = fmaxf(reduction[dimension], reduction[dimension + width]);
+      __syncthreads();
+    }
+    const float next_maximum = fmaxf(maximum, reduction[0]);
+    const float correction = expf(maximum - next_maximum);
+    const float probability = dimension < count ? expf(score - next_maximum) : 0;
+    __syncthreads();
+    weights[dimension] = probability;
+    reduction[dimension] = probability;
+    __syncthreads();
+    for (int width = 64; width; width /= 2) {
+      if (dimension < width)
+        reduction[dimension] += reduction[dimension + width];
+      __syncthreads();
+    }
+    sum = sum * correction + reduction[0];
+    accumulator *= correction;
+    for (int key = 0; key < count; ++key) {
+      const int offset = begin + key;
+      const int physical = table[static_cast<int64_t>(request) * columns + offset / page_size];
+      const int64_t slot =
+          ((static_cast<int64_t>(physical) * page_size + offset % page_size) *
+           kv_heads + kv_head) * 128 + dimension;
+      accumulator = fmaf(weights[key], static_cast<float>(value_cache[slot]), accumulator);
+    }
+    maximum = next_maximum;
+    begin += count;
+    __syncthreads();
+  }
+  output[(static_cast<int64_t>(token) * heads + head) * 128 + dimension] =
+      __hip_bfloat16(accumulator / sum);
 }
 
 __global__ void AppendInt8(
@@ -372,6 +570,85 @@ __global__ void Attend(
 
 } // namespace
 
+extern "C" HIP_KERNEL_API int hip_paged_attention_bf16_strided(
+    void *stream, const void *query, const void *key, const void *value,
+    void *key_cache, void *value_cache,
+    const int32_t *cumulative, const int32_t *past_lengths,
+    const int32_t *table, const void *cos_cache, const void *sin_cache,
+    const void *q_norm_weight, const void *k_norm_weight, void *query_scratch,
+    void *output, int tokens, int batch, int columns, int blocks, int page_size,
+    int heads, int kv_heads, int query_stride, int kv_stride,
+    int rotary_length, int window, float scale,
+    float epsilon, void *error_flag) {
+  if (!stream || !query || !key || !value || !key_cache || !value_cache || !cumulative ||
+      !past_lengths || !table || !cos_cache || !sin_cache || !q_norm_weight ||
+      !k_norm_weight || !query_scratch || !output || !error_flag ||
+      tokens <= 0 || batch <= 0 || batch > tokens || batch > 65535 ||
+      columns <= 0 || blocks <= 0 || page_size < 16 || page_size > 4096 ||
+      (page_size & (page_size - 1)) != 0 || heads <= 0 || heads > 65535 ||
+      kv_heads <= 0 || kv_heads > heads || heads + kv_heads > 65535 ||
+      heads % kv_heads != 0 || query_stride < heads * 128 ||
+      kv_stride < kv_heads * 128 ||
+      rotary_length <= 0 || window <= 0 || window > 4096 ||
+      !std::isfinite(scale) || scale < 0 || !std::isfinite(epsilon) ||
+      epsilon <= 0)
+    return hipErrorInvalidValue;
+  const auto hip_stream = static_cast<hipStream_t>(stream);
+  auto *error = static_cast<int *>(error_flag);
+  (void)hipGetLastError();
+  hipLaunchKernelGGL(ValidateWindowed, dim3(batch), dim3(128), 0, hip_stream,
+                     cumulative, past_lengths, table, tokens, batch, columns,
+                     blocks, page_size, rotary_length, window, error);
+  auto status = hipGetLastError();
+  if (status != hipSuccess)
+    return hipdnn_device_execution_status(status);
+  hipLaunchKernelGGL(
+      PrepareBf16, dim3(tokens, heads + kv_heads), dim3(128), 0, hip_stream,
+      static_cast<const __hip_bfloat16 *>(query),
+      static_cast<const __hip_bfloat16 *>(key),
+      static_cast<const __hip_bfloat16 *>(value),
+      static_cast<__hip_bfloat16 *>(key_cache),
+      static_cast<__hip_bfloat16 *>(value_cache), cumulative, past_lengths, table,
+      static_cast<const __hip_bfloat16 *>(cos_cache),
+      static_cast<const __hip_bfloat16 *>(sin_cache),
+      static_cast<const __hip_bfloat16 *>(q_norm_weight),
+      static_cast<const __hip_bfloat16 *>(k_norm_weight),
+      static_cast<__hip_bfloat16 *>(query_scratch), batch, columns, page_size,
+      heads, kv_heads, query_stride, kv_stride, epsilon, error);
+  status = hipGetLastError();
+  if (status != hipSuccess)
+    return hipdnn_device_execution_status(status);
+  hipLaunchKernelGGL(
+      AttendBf16, dim3(tokens, heads), dim3(128), 0, hip_stream,
+      static_cast<const __hip_bfloat16 *>(query_scratch),
+      static_cast<const __hip_bfloat16 *>(key_cache),
+      static_cast<const __hip_bfloat16 *>(value_cache), cumulative, past_lengths,
+      table, static_cast<__hip_bfloat16 *>(output), batch, columns, page_size,
+      heads, kv_heads, window, scale == 0 ? 0.08838834765f : scale, error);
+  return hipdnn_device_execution_status(hipGetLastError());
+}
+
+extern "C" HIP_KERNEL_API int hip_paged_attention_bf16(
+    void *stream, const void *query, void *key_cache, void *value_cache,
+    const int32_t *cumulative, const int32_t *past_lengths,
+    const int32_t *table, const void *cos_cache, const void *sin_cache,
+    const void *q_norm_weight, const void *k_norm_weight, void *query_scratch,
+    void *output, int tokens, int batch, int columns, int blocks, int page_size,
+    int heads, int kv_heads, int rotary_length, int window, float scale,
+    float epsilon, void *error_flag) {
+  if (!query || heads <= 0 || heads > 65535 || kv_heads <= 0 ||
+      kv_heads > heads || heads + kv_heads > 65535)
+    return hipErrorInvalidValue;
+  const auto *packed = static_cast<const __hip_bfloat16 *>(query);
+  const int stride = (heads + 2 * kv_heads) * 128;
+  return hip_paged_attention_bf16_strided(
+      stream, query, packed + heads * 128,
+      packed + (heads + kv_heads) * 128, key_cache, value_cache, cumulative,
+      past_lengths, table, cos_cache, sin_cache, q_norm_weight, k_norm_weight,
+      query_scratch, output, tokens, batch, columns, blocks, page_size, heads,
+      kv_heads, stride, stride, rotary_length, window, scale, epsilon, error_flag);
+}
+
 extern "C" HIP_KERNEL_API int hip_paged_attention_fp16(
     void *stream, const void *query, void *key_cache, void *value_cache,
     const int32_t *cumulative_lengths, const int32_t *past_lengths,
@@ -401,7 +678,7 @@ extern "C" HIP_KERNEL_API int hip_paged_attention_fp16(
                      static_cast<int>(block_size), static_cast<int>(rotary_length), error);
   auto status = hipGetLastError();
   if (status != hipSuccess)
-    return status;
+    return hipdnn_device_execution_status(status);
   hipLaunchKernelGGL((Append<64, false, __half>), dim3(tokens, kv_num_heads), dim3(kHeadSize), 0, hip_stream,
                      static_cast<const __half *>(query), nullptr, nullptr,
                      static_cast<__half *>(key_cache), static_cast<__half *>(value_cache),
@@ -412,7 +689,7 @@ extern "C" HIP_KERNEL_API int hip_paged_attention_fp16(
                      static_cast<int>(num_heads), static_cast<int>(kv_num_heads), error);
   status = hipGetLastError();
   if (status != hipSuccess)
-    return status;
+    return hipdnn_device_execution_status(status);
   hipLaunchKernelGGL((Attend<64, false, __half>), dim3(tokens, num_heads), dim3(kThreads), 0, hip_stream,
                      static_cast<const __half *>(query),
                      static_cast<const __half *>(key_cache), static_cast<const __half *>(value_cache),
@@ -422,7 +699,7 @@ extern "C" HIP_KERNEL_API int hip_paged_attention_fp16(
                      static_cast<int>(batch), static_cast<int>(table_columns),
                      static_cast<int>(block_size), static_cast<int>(num_heads),
                      static_cast<int>(kv_num_heads), scale == 0 ? 0.125f : scale, error);
-  return hipGetLastError();
+  return hipdnn_device_execution_status(hipGetLastError());
 }
 
 extern "C" HIP_KERNEL_API int hip_paged_attention_separate(
@@ -454,7 +731,7 @@ extern "C" HIP_KERNEL_API int hip_paged_attention_separate(
                      kMaximumContext, error);
   auto status = hipGetLastError();
   if (status != hipSuccess)
-    return status;
+    return hipdnn_device_execution_status(status);
   const auto launch = [&](auto *type) {
     using T = std::remove_pointer_t<decltype(type)>;
     hipLaunchKernelGGL(
@@ -467,7 +744,7 @@ extern "C" HIP_KERNEL_API int hip_paged_attention_separate(
       static_cast<int>(heads), static_cast<int>(kv_heads), error);
     auto launch_status = hipGetLastError();
     if (launch_status != hipSuccess)
-      return launch_status;
+      return hipdnn_device_execution_status(launch_status);
     hipLaunchKernelGGL(
       (Attend<256, true, T>), dim3(tokens, heads), dim3(kThreads), 0, hip_stream,
       static_cast<const T *>(query), static_cast<const __half *>(key_cache),
@@ -476,7 +753,7 @@ extern "C" HIP_KERNEL_API int hip_paged_attention_separate(
       static_cast<int>(table_columns), static_cast<int>(page_size),
       static_cast<int>(heads), static_cast<int>(kv_heads),
       scale == 0 ? 0.0625f : scale, error);
-    return hipGetLastError();
+    return hipdnn_device_execution_status(hipGetLastError());
   };
   if (input_dtype == HIP_DTYPE_FLOAT32)
     return launch(static_cast<float *>(nullptr));
@@ -501,18 +778,18 @@ extern "C" HIP_KERNEL_API int hip_paged_int8_append(
                     columns, blocks, page_size, 262144, error);
   auto status = hipGetLastError();
   if (status != hipSuccess)
-    return status;
+    return hipdnn_device_execution_status(status);
   hipLaunchKernelGGL(ValidateScales, dim3(kv_heads), dim3(256), 0, hip_stream,
                     key_scale, value_scale, kv_heads * 256, error,
                     residual_bits);
   status = hipGetLastError();
   if (status != hipSuccess)
-    return status;
+    return hipdnn_device_execution_status(status);
   hipLaunchKernelGGL(AppendInt8, dim3(tokens, kv_heads), dim3(256), 0,
                     hip_stream, key, value, key_cache, value_cache,
                     cumulative, past, table, key_scale, value_scale, batch,
                     columns, page_size, kv_heads, error, residual_bits);
-  return hipGetLastError();
+  return hipdnn_device_execution_status(hipGetLastError());
 }
 
 extern "C" HIP_KERNEL_API int hip_paged_int8_pack_query(
@@ -522,7 +799,7 @@ extern "C" HIP_KERNEL_API int hip_paged_int8_pack_query(
   hipLaunchKernelGGL(PackQuery, dim3(queries, heads), dim3(256), 0,
                     static_cast<hipStream_t>(stream), query, packed,
                     queries, heads, kv_heads, error);
-  return hipGetLastError();
+  return hipdnn_device_execution_status(hipGetLastError());
 }
 
 extern "C" HIP_KERNEL_API int hip_paged_int8_pack_cache(
@@ -537,7 +814,7 @@ extern "C" HIP_KERNEL_API int hip_paged_int8_pack_cache(
                     static_cast<hipStream_t>(stream), key_cache, value_cache,
                     table, key_scale, value_scale, key, value, begin, count,
                     page_size, kv_heads, error, residual_bits);
-  return hipGetLastError();
+  return hipdnn_device_execution_status(hipGetLastError());
 }
 
 extern "C" HIP_KERNEL_API int hip_paged_int8_softmax(
@@ -549,7 +826,7 @@ extern "C" HIP_KERNEL_API int hip_paged_int8_softmax(
                     static_cast<hipStream_t>(stream), scores, statistics,
                     queries, keys, heads, kv_heads, query_position,
                     key_position, scale, error);
-  return hipGetLastError();
+  return hipdnn_device_execution_status(hipGetLastError());
 }
 
 extern "C" HIP_KERNEL_API int hip_paged_int8_merge(
@@ -561,5 +838,5 @@ extern "C" HIP_KERNEL_API int hip_paged_int8_merge(
                     static_cast<hipStream_t>(stream), partial, accumulator,
                     statistics, output, queries, heads, kv_heads, first,
                     last, error);
-  return hipGetLastError();
+  return hipdnn_device_execution_status(hipGetLastError());
 }

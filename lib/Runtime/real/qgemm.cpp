@@ -137,8 +137,9 @@ int wrap_qgemm(RuntimeState *state, const void *A, const void *B, const void *C,
   void *workspace = nullptr;
   size_t workspace_bytes = 0;
   const size_t split_bytes = hip_qgemm_workspace_bytes(M, N, K);
-  if (split_bytes > 0 &&
-      hipdnn_ep_state_ensure_workspace(state, split_bytes) == 0) {
+  if (split_bytes > 0) {
+    if (hipdnn_ep_state_ensure_workspace(state, split_bytes) != 0)
+      return -1;
     workspace = hipdnn_ep_state_get_workspace(state);
     workspace_bytes = hipdnn_ep_state_get_workspace_size(state);
   }

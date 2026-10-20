@@ -292,6 +292,7 @@ compile_to_bitcode(hipdnn_ep_runtime_if.cpp runtime_if.bc)
 compile_to_bitcode(op_profile.cpp runtime_op_profile.bc)
 compile_to_bitcode(chrome_trace.cpp runtime_chrome_trace.bc)
 compile_to_bitcode(output_allocator.cpp runtime_output_allocator.bc)
+compile_to_bitcode(device_scratch.cpp runtime_device_scratch.bc)
 # Op-state slots ABI + reference constructors. Shared (host-only allocation),
 # so the same TU serves both the real and mock runtimes.
 compile_to_bitcode(op_state.cpp runtime_op_state.bc)
@@ -323,6 +324,7 @@ if(NOT BUILD_MOCK_RUNTIME)
     compile_to_bitcode(real/skip_simplified_layer_norm.cpp runtime_skip_simplified_layer_norm.bc)
     compile_to_bitcode(real/rotary_embedding.cpp runtime_rotary_embedding.bc)
     compile_to_bitcode(real/gqa.cpp runtime_gqa.bc)
+    compile_to_bitcode(real/paged_attention.cpp runtime_paged_attention.bc)
     compile_to_bitcode(real/cast.cpp runtime_cast.bc)
     compile_to_bitcode(real/range.cpp runtime_range.bc)
     compile_to_bitcode(real/gather.cpp runtime_gather.bc)
@@ -414,6 +416,7 @@ if(NOT BUILD_MOCK_RUNTIME)
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_op_profile.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_chrome_trace.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_output_allocator.bc
+        ${CMAKE_CURRENT_BINARY_DIR}/runtime_device_scratch.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_op_state.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_memory.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_hip.bc
@@ -434,6 +437,7 @@ if(NOT BUILD_MOCK_RUNTIME)
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_skip_simplified_layer_norm.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_rotary_embedding.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_gqa.bc
+        ${CMAKE_CURRENT_BINARY_DIR}/runtime_paged_attention.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_cast.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_range.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_gather.bc
@@ -537,6 +541,7 @@ else()
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_op_profile.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_chrome_trace.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_output_allocator.bc
+        ${CMAKE_CURRENT_BINARY_DIR}/runtime_device_scratch.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_op_state.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_op_state_stubs.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_memory.bc

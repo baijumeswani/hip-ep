@@ -129,7 +129,7 @@ applies to any CDNA part, not just gfx950.
 | **Quantized / INT8 KV cache for GQA** | **Hard error, returns −1.** Use an fp16 KV cache. | `lib/Runtime/real/gqa.cpp` |
 | WMMA fused GQA (the `hip_gqa_flash_prefill_*` / `_decode_*` kernels, including the attention-sink and sliding-window prefill) | Silently routed to the decomposed hipBLASLt pipeline | `gqa.cpp` (`fused_supported`) |
 | Legacy `flash_decode` launcher | Silently disabled; `HIPDNN_EP_GQA_FLASH_DECODE=1` has no effect | `gqa.cpp` (`gqa_flash_decode_enabled`) |
-| WMMA MatMulNBits prefill | Replaced by dequant-once + hipBLASLt GEMM for INT4 M≥16 | `matmul_nbits_kernel.hip`, `matmul_nbits.cpp` |
+| WMMA MatMulNBits prefill | Replaced by shared FP16 dequant scratch + hipBLASLt GEMM for INT4 M≥16 | `matmul_nbits_kernel.hip`, `matmul_nbits.cpp` |
 | WMMA MultiHeadAttention flash prefill | Silently routed to the decomposed path | `multi_head_attention.cpp` |
 
 Only the first is user-visible. If you point an INT8-KV-cache model at MI350X
@@ -151,8 +151,13 @@ On MI350X, hipBLASLt is not an optimization — it is the execution path:
 - **GQA** always uses `gqa_forward_hipblaslt()`, because the fused WMMA path is
   off. A null handle fails the op.
 - **INT4 MatMulNBits prefill** (batch 1, `K % 32 == 0`, M ≥ 16, fp16) dequantizes
-  the weight to fp16 once, caches it per weight pointer, and runs the GEMM
-  through hipBLASLt on the MFMA matrix cores.
+  the weight into one reusable per-session fp16 scratch buffer and runs the GEMM
+  through hipBLASLt on the MFMA matrix cores. The scratch retains only the largest
+  expanded matrix, not the sum of all layer weights; every prefill re-dequantizes
+  its current weight. It is separate from the GEMM workspace, which may grow
+  during tuning. Scratch growth drains the session stream before freeing the old
+  input buffer, and allocation/dequantization failures propagate instead of
+  silently switching kernels.
 - Session creation calls `hipblasLtCreate()` and fails if it does not succeed.
 
 The first call for each new `(M, N, K)` shape **autotunes** the hipBLASLt
@@ -161,6 +166,11 @@ is independent of `HIPDNN_EP_AUTOTUNE` (which gates a different code path) and
 has two consequences worth knowing: the first request of a shape is slower, and
 dense-prefill timings vary run to run because a cold autotune under ramping GPU
 clocks can elect a different algorithm.
+
+MatMulNBits consumes raw blockwise weights; nonzero CUDA `weight_prepacked`
+layouts are rejected. For W4A16 qualification, set `HIPDNN_EP_MATMUL_DP4A=0`
+before initializing the backend: its default-on DP4A path requantizes narrow-M
+activations to INT8 and is a different numerical contract.
 
 ### Environment variables that behave differently
 

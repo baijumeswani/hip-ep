@@ -569,7 +569,7 @@ dsa_attention_kernel(const _Float16 *__restrict__ query,
       __syncthreads();
     }
 
-    const unsigned vmask = __builtin_amdgcn_ballot_w32(idx_cur >= 0);
+    const unsigned vmask = static_cast<unsigned>(__ballot(idx_cur >= 0));
     float tmax = -INFINITY;
 #pragma unroll
     for (int sj = 0; sj < N_TILES; ++sj) {
@@ -584,7 +584,7 @@ dsa_attention_kernel(const _Float16 *__restrict__ query,
     tmax = fmaxf(tmax, swap_halves(tmax)) * sc;
     // Every lane of all ND waves sees the same scores, so the decision is
     // uniform across the block.
-    if (__builtin_amdgcn_ballot_w32(tmax > m_run + kRescaleSlack) != 0) {
+    if (__ballot(tmax > m_run + kRescaleSlack) != 0) {
       const float m_new = fmaxf(m_run, tmax);
       // Exponent <= 0: the raw v_exp_f32 needs none of exp2f's denormal
       // fixup (see the GQA core).

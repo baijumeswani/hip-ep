@@ -67,7 +67,11 @@ def _make_simplified_layer_norm_model(
 
 
 def _make_skip_simplified_layer_norm_model(
-    input_shape: list[int], dtype: np.dtype = np.float16, with_bias: bool = False
+    input_shape: list[int],
+    dtype: np.dtype = np.float16,
+    *,
+    with_sum: bool = True,
+    with_bias: bool = False,
 ):
     """Build a SkipSimplifiedLayerNormalization ONNX model.
 
@@ -92,7 +96,7 @@ def _make_skip_simplified_layer_norm_model(
     node = helper.make_node(
         "SkipSimplifiedLayerNormalization",
         inputs,
-        ["Y", "", "", "Y3"],
+        ["Y", "", "", "Y3"] if with_sum else ["Y"],
         domain="com.microsoft",
         epsilon=1e-5,
     )
@@ -100,10 +104,11 @@ def _make_skip_simplified_layer_norm_model(
     model = make_model_from_nodes(
         [node],
         [X, skip],
-        [Y, Y3],
+        [Y, Y3] if with_sum else [Y],
         initializers=initializers,
         extra_opsets=[ms_opset],
     )
+    model.ir_version = 10
     return model
 
 
@@ -339,6 +344,31 @@ class TestSimplifiedLayerNorm:
 
 
 class TestSkipSimplifiedLayerNorm:
+    @pytest.mark.parametrize("hidden", [33, 896])
+    @pytest.mark.parametrize("dtype", [np.float16, np.float32])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_optional_residual_preserves_normalized_output(
+        self, model_runner, hidden, dtype, with_bias
+    ):
+        shape = [1, 4, hidden]
+        rng = np.random.default_rng(109)
+        inputs = [rng.uniform(-2, 2, shape).astype(dtype) for _ in range(2)]
+        results = []
+        for with_sum in (False, True):
+            model = _make_skip_simplified_layer_norm_model(
+                shape, dtype, with_sum=with_sum, with_bias=with_bias
+            )
+            actual, expected = model_runner.run_sample(
+                model,
+                inputs,
+                name=f"optional_residual_{hidden}_{dtype.__name__}_{with_bias}_{with_sum}",
+            )
+            compare_outputs(
+                actual, expected, atol=2e-3 if dtype == np.float16 else 1e-5
+            )
+            results.append(actual[0])
+        np.testing.assert_array_equal(results[0], results[1])
+
     @pytest.mark.parametrize(
         "input_shape",
         [

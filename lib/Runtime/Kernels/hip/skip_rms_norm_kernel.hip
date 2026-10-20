@@ -17,16 +17,14 @@
  * reduction, FP32 accumulators throughout.
  *   Pass A: form sum, accumulate sum^2, and write `input_skip_bias_sum`
  *           when the caller asked for it.
- *   Pass B: re-read sum from `input_skip_bias_sum` if it was written,
- *           otherwise recompute it, then write y.
+ *   Pass B: recompute the FP32 sum, then write y.
  *
  * Being able to recompute is what lets this kernel run with no workspace at
  * all. The MIOpen path it replaces needed a scratch buffer the size of the
  * whole tensor whenever input_skip_bias_sum was absent; two extra reads of
  * already-cached data beat an allocation plus two more full passes over
- * memory. When the buffer does exist, reading it back is both cheaper than
- * recomputing and matches MIOpen, which likewise normalizes the rounded
- * intermediate rather than a full-precision one.
+ * memory. Recomputing also keeps normalization independent of the optional
+ * FP16 residual output, whose rounding must not affect y.
  *
  * The VEC2 template parameter selects a packed __half2 body; this kernel
  * touches up to six tensors per row, so the 2-wide path matters more here
@@ -154,22 +152,17 @@ hip_skip_rms_norm_kernel(const TIn *__restrict__ input,
     const __half2 *s2 = reinterpret_cast<const __half2 *>(s_row);
     const __half2 *b2 = reinterpret_cast<const __half2 *>(bias);
     const __half2 *g2 = reinterpret_cast<const __half2 *>(gamma);
-    const __half2 *sum2 = reinterpret_cast<const __half2 *>(sum_row);
     __half2 *y2 = reinterpret_cast<__half2 *>(y_row);
     for (int64_t i = threadIdx.x; i < norm_size2; i += blockDim.x) {
+      float2 x = __half22float2(x2[i]);
+      float2 s = __half22float2(s2[i]);
       float2 t;
-      if (sum2) {
-        t = __half22float2(sum2[i]);
-      } else {
-        float2 x = __half22float2(x2[i]);
-        float2 s = __half22float2(s2[i]);
-        t.x = x.x + s.x;
-        t.y = x.y + s.y;
-        if (b2) {
-          float2 b = __half22float2(b2[i]);
-          t.x += b.x;
-          t.y += b.y;
-        }
+      t.x = x.x + s.x;
+      t.y = x.y + s.y;
+      if (b2) {
+        float2 b = __half22float2(b2[i]);
+        t.x += b.x;
+        t.y += b.y;
       }
       float2 g = __half22float2(g2[i]);
       float2 r;
@@ -179,14 +172,9 @@ hip_skip_rms_norm_kernel(const TIn *__restrict__ input,
     }
   } else {
     for (int64_t i = threadIdx.x; i < norm_size; i += blockDim.x) {
-      float t;
-      if (sum_row) {
-        t = skip_load(sum_row + i);
-      } else {
-        t = skip_load(x_row + i) + skip_load(s_row + i);
-        if (bias)
-          t += skip_load(bias + i);
-      }
+      float t = skip_load(x_row + i) + skip_load(s_row + i);
+      if (bias)
+        t += skip_load(bias + i);
       skip_store(y_row + i, t * inv_rms * skip_load(gamma + i));
     }
   }
@@ -210,8 +198,8 @@ hip_skip_rms_norm_kernel(const TIn *__restrict__ input,
 // 2880-wide row and is no slower for many rows. Narrower rows keep 256.
 //
 // Numerics follow the two-pass kernel: sum^2 accumulates the fp32 sum, and
-// when `sum_out` is written the normalization reads the sum rounded to its
-// storage type.
+// the optional residual output is rounded only when stored, not before
+// normalization.
 
 static constexpr int kRowBlockSize = 512;
 static constexpr int kRowSmallBlockSize = 256;
@@ -236,13 +224,6 @@ __device__ inline void row_st4(__half *p, int64_t i, float4 v) {
   u.x = *reinterpret_cast<const unsigned *>(&a);
   u.y = *reinterpret_cast<const unsigned *>(&b);
   reinterpret_cast<uint2 *>(p)[i] = u;
-}
-__device__ inline float4 row_round(const float *, float4 v) { return v; }
-__device__ inline float4 row_round(const __half *, float4 v) {
-  return make_float4(__half2float(__float2half(v.x)),
-                     __half2float(__float2half(v.y)),
-                     __half2float(__float2half(v.z)),
-                     __half2float(__float2half(v.w)));
 }
 
 // One block per row. blockDim.x == BS, norm_size % 4 == 0,
@@ -286,7 +267,6 @@ hip_skip_rms_norm_row_kernel(const TIn *__restrict__ input,
             t[v].w * t[v].w;
       if (sum_out) {
         row_st4(sum_out + base, i, t[v]);
-        t[v] = row_round(sum_out, t[v]);
       }
     }
   }

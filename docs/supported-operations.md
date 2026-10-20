@@ -8,6 +8,37 @@ This reference summarizes ONNX operations handled by the built-in ONNX-to-HIP pi
 
 The conversion registrations in `lib/Conversion/OnnxToHip/OnnxToHip.cpp` and the corresponding LIT/numeric tests are the source of truth. Individual operations may have data-type, rank, attribute, or dynamic-shape restrictions that are documented in their conversion and test files.
 
+### FP16 paged attention qualification
+
+`com.microsoft::PagedAttention` currently accepts packed FP16 QKV, head size 64,
+grouped query heads, full causal attention, and fused non-interleaved RoPE with
+FP16 cosine/sine tables. Its int32 cumulative lengths, past lengths and block
+table are device-resident. Sequence length is limited to 4,096 tokens; page size
+must be a power of two from 16 through 4,096. Separate Q/K/V, local windows, sinks,
+QK normalization inputs, softcap, and quantized/rotated KV are rejected rather
+than silently approximated.
+
+The caller must bind each present cache to the corresponding past allocation.
+Before mutation, a validation kernel checks sequence/page bounds, metadata
+extents, duplicate pages, and cross-request writes that would overlap a peer's
+live state. Shared read-only prefix pages are allowed. Malformed metadata returns
+an execution error without modifying caches; the same session can then run valid
+inputs.
+
+The output-allocator execution boundary drains its inference stream before returning,
+including when the compiled function fails or throws, and clears its borrowed
+allocation callback before leaving scope. It does not fence unrelated streams.
+A failed drain prints a diagnostic and
+aborts directly: fatal logging alone is insufficient because a host logger can
+throw and turn it into a recoverable error. Linux numeric contract tests use a
+test-only interposer to verify this fail-stop behavior without launching a
+destructive GPU fault.
+
+`SkipSimplifiedLayerNormalization` accumulates and normalizes its residual sum
+in FP32, rounding only when storing FP16 outputs. Requesting the optional residual
+output does not change the normalized output; scalar and packed paths are tested
+with and without bias against the ORT CPU implementation.
+
 ## Runtime-backed operations
 
 | Operation | Backend or lowering |
@@ -112,9 +143,10 @@ The conversion registrations in `lib/Conversion/OnnxToHip/OnnxToHip.cpp` and the
 | MultiHeadAttention (`com.microsoft`) | Lowered to GroupQueryAttention or decomposed hipBLASLt/custom-kernel paths |
 | Attention (`com.microsoft`) | Fused QKV split into GroupQueryAttention. Equal Q/K/V sizes may be inferred from a `[H, 3H]` weight. Bidirectional and causal, with static or dynamic batch and sequence. A rank-1 length or rank-2 padding mask becomes an additive attention bias. |
 | Attention (`ai.onnx`, opset 23/24) | Lowered to GroupQueryAttention for supported rank-3/rank-4, causal/masked, output, and KV-cache forms. With `is_causal = 1`, a mask built as `Where(And(key padding, causal [, window]), 0, fill)` keeps the fused flash kernels: only the key-padding conjunct is kept, as a per-key bias. The kernels clamp that bias at -65504, so a `-inf` fill (including fp32 `-3.4e38` cast to fp16) masks a key the way -65504 does and a fully masked row stays finite. The causal conjunct is dropped only when both of its sides read one position `CumSum` or `Range` with the same constant offset. Fused prefill applies that bias at head dim 128; other head dims run the decomposed path. On a sliding-window layer with a separate past buffer, `present` rows older than the window (rounded down to 64 keys) are not written, since no later step reads them |
-| MatMulNBits (`com.microsoft`) | Custom HIP kernel |
+| MatMulNBits (`com.microsoft`) | Raw blockwise weights; CUDA `weight_prepacked` layouts are rejected. Custom HIP kernels, with hipBLASLt for eligible wave64 INT4 prefill using one reusable FP16 weight scratch per session. Set `HIPDNN_EP_MATMUL_DP4A=0` before initialization to preserve FP16 activations instead of default-on narrow-M activation requantization. |
 | MatMulBnb4 (`com.microsoft`) | HIP dequant of FP4 (`quant_type` 0) or NF4 (`quant_type` 1) into `[N, K]`, then `hip.matmul` with `transB = 1`. The first packed value is the high nibble. Static shapes pull that dequant into the rocMLIR matmul kernel. A dynamic activation leaves the dequant on HIP and the GEMM on hipBLASLt. Block size 16, 32, 64, 128, or 256. `transB` must be 1 and `training_mode` must be 0 |
 | QMoE (`com.microsoft`) | Custom HIP kernel. FP16 activations with 2-bit or 4-bit expert weights in the schema `[E, N, K/pack]` layout. Block size must be a power of two and at least 32. SwiGLU intermediates beyond the fp16 range do not overflow, as in the CPU reference: decode keeps them in fp32, and prefill stores such a row divided by a power of two, which is exact except for elements pushed into fp16 subnormals. The fc2 bias of a scaled row is added after the rescale. Sigmoid + correction-bias routing built outside the op (`TopK` over `Sigmoid(logits) + bias`, renormalized and scaled weights, two `ScatterElements` into the dense router inputs) is folded into the op and routed on the device from the fp32 logits |
+| PagedAttention (`com.microsoft`) | FP16 packed rank-2 QKV, head size 64, grouped heads, causal attention and non-interleaved fused RoPE. FP16 `[blocks, page_size, kv_heads, 64]` caches must be caller-bound as identical past/present GPU buffers. Int32 cumulative lengths, past lengths and block table reside on device; rotary tables are FP16. Context is limited to 4096 tokens, with power-of-two page sizes 16–4096. Metadata is validated before any cache write. Separate Q/K/V, QK norm, sinks, windows and quantized/rotated caches are rejected. |
 | GatherBlockQuantized (`com.microsoft`) | Custom HIP kernel |
 | QuantizeLinear | Custom HIP kernel |
 | DynamicQuantizeLinear | Decomposed to single-axis ReduceMin/ReduceMax, scale and zero-point math, and `hip.quantize_linear` with axis 0. A zero input range selects scale 1 |

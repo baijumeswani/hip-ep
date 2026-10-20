@@ -5,6 +5,7 @@
 
 """Raw INT4 qualification using the pinned Qwen fixture's actual weights."""
 
+import ctypes
 import gc
 import json
 import os
@@ -193,7 +194,7 @@ def test_qwen_w4a16_dynamic_shapes(w4a16_weights, request, tmp_path, dtype, k, n
     session = ort.InferenceSession(str(model_path), sess_options=options)
     rng = np.random.default_rng(27)
     # Revisit both dispatch sides after changing M, on the same compiled graph.
-    for rows in (1, 2, 7, 8, 16, 128, 7, 16, 1, 128):
+    for rows in (1, 2, 3, 7, 8, 16, 17, 128, 3, 16, 1, 128):
         source = rng.uniform(-1, 1, (rows, k)).astype(dtype)
         expected = source.astype(np.float32) @ dense.T
         actual = session.run(None, {"X": source})[0].astype(np.float32)
@@ -218,3 +219,81 @@ def test_qwen_w4a16_dynamic_shapes(w4a16_weights, request, tmp_path, dtype, k, n
     assert assigned == {provider}
     del session, options
     gc.collect()
+
+
+@pytest.mark.parametrize("k", [32, 65])
+@pytest.mark.parametrize("scale_dtype", [np.float16, np.float32])
+@pytest.mark.parametrize("offsets", [(0, 0), (4, 1)])
+def test_fp32_small_m_element_aligned_inputs(w4a16_weights, k, scale_dtype, offsets):
+    """Caller-owned FP32/byte tensors need not have float4/uint32 alignment."""
+    _, device, _ = w4a16_weights
+    memory = device.memory_info(ort.OrtDeviceMemoryType.DEFAULT)
+    assert memory.device_id == 0 and memory.device_vendor_id == 0x1002
+    library = os.environ.get("HIP_CUSTOM_KERNEL_LIBRARY")
+    if not library:
+        pytest.skip(
+            "Set HIP_CUSTOM_KERNEL_LIBRARY to the device's custom-kernel library"
+        )
+    hip = ctypes.CDLL(
+        os.environ.get(
+            "HIP_RUNTIME_LIBRARY",
+            "amdhip64.dll" if os.name == "nt" else "libamdhip64.so",
+        )
+    )
+    kernels = ctypes.CDLL(str(Path(library).resolve()))
+    kernel = kernels.hip_matmul_nbits_gemv_fp32
+    kernel.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * 4
+    kernel.restype = ctypes.c_int
+    stream = ctypes.c_void_p()
+    assert hip.hipStreamCreate(ctypes.byref(stream)) == 0
+    try:
+        rng = np.random.default_rng(91)
+        n = 17
+        groups = (k + 31) // 32
+        packed = rng.integers(0, 256, (n, groups, 16), dtype=np.uint8)
+        scales = rng.uniform(-0.01, 0.01, (n, groups)).astype(scale_dtype)
+        codes = np.stack((packed & 15, packed >> 4), axis=-1).reshape(n, groups, 32)
+        dense = ((codes.astype(np.float32) - 8) * scales[:, :, None]).reshape(n, -1)[
+            :, :k
+        ]
+        for rows in (1, 3, 16):
+            source = rng.uniform(-1, 1, (rows, k)).astype(np.float32)
+            buffers = []
+            pointers = []
+            for data, offset in (
+                (source, offsets[0]),
+                (packed, offsets[1]),
+                (scales, 0),
+            ):
+                storage = np.zeros(data.nbytes + offset, dtype=np.uint8)
+                storage[offset:] = data.view(np.uint8).reshape(-1)
+                value = ort.OrtValue.ortvalue_from_shape_and_type(
+                    storage.shape, np.uint8, memory_info=memory
+                )
+                value.update_inplace(storage)
+                buffers.append(value)
+                pointers.append(ctypes.c_void_p(value.data_ptr() + offset))
+            output = ort.OrtValue.ortvalue_from_shape_and_type(
+                (rows, n), np.float32, memory_info=memory
+            )
+            assert pointers[0].value % 16 == offsets[0]
+            assert pointers[1].value % 4 == offsets[1]
+            assert (
+                kernel(
+                    stream,
+                    *pointers,
+                    None,
+                    ctypes.c_void_p(output.data_ptr()),
+                    rows,
+                    n,
+                    k,
+                    np.dtype(scale_dtype).itemsize,
+                )
+                == 0
+            )
+            assert hip.hipStreamSynchronize(stream) == 0
+            np.testing.assert_allclose(
+                output.numpy(), source @ dense.T, atol=3e-5, rtol=3e-5
+            )
+    finally:
+        assert hip.hipStreamDestroy(stream) == 0

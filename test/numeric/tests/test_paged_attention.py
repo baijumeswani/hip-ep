@@ -31,13 +31,26 @@ from framework.ort_ep_backend import _parse_ep_options
     ],
 )
 def paged_session(request, tmp_path_factory):
-    layout, dtype = request.param
+    yield from _paged_session(request, tmp_path_factory, request.param)
+
+
+@pytest.fixture(scope="module")
+def wide_paged_session(request, tmp_path_factory):
+    yield from _paged_session(
+        request, tmp_path_factory, ("int8_residual8", np.float32, 64, 8)
+    )
+
+
+def _paged_session(request, tmp_path_factory, parameters):
+    layout, dtype = parameters[:2]
     separate = layout != "packed64"
     quantized = layout.startswith("int8")
     residual_bits = 8 if layout == "int8_residual8" else 0
     cache_dtype = TensorProto.INT8 if quantized else TensorProto.FLOAT16
     activation = helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
     heads, kv_heads, head_size = (24, 4, 256) if separate else (14, 2, 64)
+    if len(parameters) == 4:
+        heads, kv_heads = parameters[2:]
     output_width = heads * head_size
     cache_shape = [
         "blocks",
@@ -50,7 +63,9 @@ def paged_session(request, tmp_path_factory):
         pytest.skip("--ep-dll is required")
     if os.environ.get("HIPDNN_EP_STRICT") != "1":
         pytest.fail("PagedAttention qualification requires HIPDNN_EP_STRICT=1")
-    provider = request.config.getoption("--ep-name") + "_paged"
+    provider = request.config.getoption("--ep-name") + (
+        f"_paged_{layout}_{dtype.__name__}_{heads}_{kv_heads}"
+    )
     ort.register_execution_provider_library(provider, str(Path(library).resolve()))
     devices = [device for device in ort.get_ep_devices() if device.ep_name == provider]
     assert len(devices) == 1
@@ -170,8 +185,11 @@ def make_inputs(
     dtype=np.float16,
     quantized=False,
     residual_bits=0,
+    head_geometry=None,
 ):
-    heads, kv_heads, head_size = (24, 4, 256) if separate else (14, 2, 64)
+    heads, kv_heads, head_size = head_geometry or (
+        (24, 4, 256) if separate else (14, 2, 64)
+    )
     rng = np.random.default_rng(1701)
     columns = max(16, (max(p + q for p, q in zip(prefixes, lengths)) + 255) // 256)
     capacity = max(2, len(prefixes))
@@ -235,6 +253,9 @@ def reference(inputs):
     separate = "key" in inputs
     quantized = "key_scale" in inputs
     heads, kv_heads, head_size = (24, 4, 256) if separate else (14, 2, 64)
+    if separate:
+        heads = inputs["query"].shape[1] // head_size
+        kv_heads = inputs["past_key"].shape[2]
     residual = quantized and inputs["past_key"].shape[-1] == 2 * head_size
     key = inputs["past_key"].copy()
     value = inputs["past_value"].copy()
@@ -329,7 +350,7 @@ def bind(session, device, inputs):
         binding.bind_ortvalue_input(name, tensor)
         tensors[name] = tensor
     output = ort.OrtValue.ortvalue_from_shape_and_type(
-        [len(inputs["query"]), 6144 if "key" in inputs else 896],
+        [len(inputs["query"]), inputs["query"].shape[1] if "key" in inputs else 896],
         inputs["query"].dtype,
         memory_info=memory,
     )
@@ -512,7 +533,8 @@ def test_paged_attention_shared_read_only_prefix(paged_session):
 
 
 @pytest.mark.parametrize(
-    "prefix,length", [(4095, 65), (8191, 2), (32767, 1), (131071, 1), (262143, 1)]
+    "prefix,length",
+    [(0, 257), (4095, 65), (8191, 2), (16384, 1), (32767, 1), (131071, 1), (262143, 1)],
 )
 def test_int8_attention_tiled_and_long_context(paged_session, prefix, length):
     if not paged_session["quantized"]:
@@ -528,6 +550,68 @@ def test_int8_attention_tiled_and_long_context(paged_session, prefix, length):
     np.testing.assert_allclose(output.numpy(), expected, atol=0.000002, rtol=0.00002)
     np.testing.assert_array_equal(tensors["past_key"].numpy(), key)
     np.testing.assert_array_equal(tensors["past_value"].numpy(), value)
+
+
+@pytest.mark.parametrize("invalid", ["duplicate", "out_of_range", "write_alias"])
+def test_int8_long_page_validation_is_atomic(paged_session, invalid):
+    if not paged_session["quantized"]:
+        pytest.skip("INT8 head-256 path only")
+    inputs = make_inputs(
+        [32768, 0], [1, 1], True, np.float32, True, paged_session["residual_bits"]
+    )
+    if invalid == "duplicate":
+        inputs["table"][0, 128] = inputs["table"][0, 0]
+    elif invalid == "out_of_range":
+        inputs["table"][0, 128] = inputs["past_key"].shape[0]
+    else:
+        inputs["table"][1, 0] = inputs["table"][0, 128]
+    binding, tensors, output = bind(
+        paged_session["session"], paged_session["device"], inputs
+    )
+    with pytest.raises(RuntimeError, match="inference_compute .* failed with code: -1"):
+        paged_session["session"].run_with_iobinding(binding)
+    np.testing.assert_array_equal(tensors["past_key"].numpy(), inputs["past_key"])
+    np.testing.assert_array_equal(tensors["past_value"].numpy(), inputs["past_value"])
+    assert np.isnan(output.numpy()).all()
+
+
+def test_int8_decode_tiled_ragged_requests(paged_session):
+    if not paged_session["quantized"]:
+        pytest.skip("INT8 head-256 path only")
+    inputs = make_inputs(
+        [16384, 0, 4097],
+        [1, 1, 1],
+        True,
+        np.float32,
+        True,
+        paged_session["residual_bits"],
+    )
+    expected, key, value = reference(inputs)
+    binding, tensors, output = bind(
+        paged_session["session"], paged_session["device"], inputs
+    )
+    paged_session["session"].run_with_iobinding(binding)
+    np.testing.assert_allclose(output.numpy(), expected, atol=0.000002, rtol=0.00002)
+    np.testing.assert_array_equal(tensors["past_key"].numpy(), key)
+    np.testing.assert_array_equal(tensors["past_value"].numpy(), value)
+
+
+def test_int8_attention_workspace_tile_downshift(wide_paged_session):
+    """Exercise both workspace downshift loops, then revisit prefill."""
+    for prefix, length in [(0, 257), (16384, 1), (0, 257)]:
+        inputs = make_inputs(
+            [prefix], [length], True, np.float32, True, 8, (64, 8, 256)
+        )
+        expected, key, value = reference(inputs)
+        binding, tensors, output = bind(
+            wide_paged_session["session"], wide_paged_session["device"], inputs
+        )
+        wide_paged_session["session"].run_with_iobinding(binding)
+        np.testing.assert_allclose(
+            output.numpy(), expected, atol=0.000002, rtol=0.00002
+        )
+        np.testing.assert_array_equal(tensors["past_key"].numpy(), key)
+        np.testing.assert_array_equal(tensors["past_value"].numpy(), value)
 
 
 @pytest.mark.parametrize(

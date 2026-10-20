@@ -272,12 +272,22 @@ paged attention accepts either activation type but always stores FP16 KV:
 FP32 Q and attention output are not narrowed, and K/V are rounded only when
 written to the cache. Packed head-64 attention remains FP16.
 
-Symmetric raw block-32 W4A32 MatMulNBits uses FP32 dequantization and GEMM,
-preserving FP32 activations, outputs and scales. It reuses the session's weight
-scratch in tiles of at most 256 output channels, independently of hipBLASLt
-workspace. It does not expand every model weight or route through the legacy
-FP16 activation adapter. Algorithms are selected for each exact matrix geometry,
-including tail tiles and the full output leading dimension.
+Symmetric raw block-32 W4A32 MatMulNBits preserves FP32 activations, outputs,
+dequantized weights and accumulation. Up to 16 flattened input rows use a
+fused INT4/FP32 GEMV with independent 32-lane reductions on both wave32 and
+wave64, without expanded-weight scratch or runtime algorithm tuning. Blocks
+reuse packed weights across four rows for batches of three through sixteen;
+one- and two-row calls retain independent rows with their original reductions
+and activation loads. FP16 and
+FP32 scales are consumed in their declared types. Larger row counts retain
+FP32 dequantization and hipBLASLt GEMM in tiles of at most 16384 output channels,
+using session-owned weight scratch independently of hipBLASLt workspace.
+Neither path retains a full expanded model or uses the legacy FP16 activation
+adapter. GEMM algorithms are selected for each exact matrix geometry, including
+tail tiles and the full output leading dimension.
+Caller-bound tensors need only their element alignment: FP32 activation
+vector loads additionally check the base address, and packed byte weights
+are loaded without imposing a wider alignment requirement.
 
 The typed hybrid wrapper signatures were introduced in runtime ABI version 2.
 Runtime ABI version 3 adds session-owned paged-attention scratch and requires
@@ -295,21 +305,28 @@ Q/K normalization and drafter attention are not part of this operation.
 Past/present cache pointers must alias exactly.
 
 Device validation checks metadata, page bounds, conflicting writes and every
-scale before appending any cache data. Only cumulative/past control vectors and
+scale before appending any cache data. Long INT8 page tables distribute the
+unchanged page checks across 128-thread blocks; FP16 launch geometry is unchanged.
+Only cumulative/past control vectors and
 the error flag are read back, once per attention call, with explicit stream
 completion. Failure to drain host readback aborts before releasing host storage.
 The optional ONNX `attention_metadata` remains a shape-checked hint; it does not
 replace validation of the actual device lengths and page table.
 
-Attention processes each request in query tiles of at most 64 tokens and KV
-tiles of at most 4096 tokens through FP32 batched hipBLASLt GEMMs and online
-softmax. K/V are dequantized once per KV head in a tile, not expanded to query
+Attention processes each request through FP32 batched hipBLASLt GEMMs and online
+softmax. Decode-only calls use one query and up to 16384 KV tokens per tile;
+prefill and mixed calls use up to 256 queries and 4096 KV tokens. Tile sizes
+adapt down toward the previous 64-query/4096-key envelope when necessary to
+preserve the workspace limit for larger head geometries.
+K/V are dequantized once per KV head in a tile, not expanded to query
 heads or to the full context. A session shares one attention scratch allocation,
 independent of BLAS workspace and weight scratch. Its request is
-`4*(3*heads*64*256 + 2*kv_heads*4096*256 + heads*64*4096 + 3*heads*64)`
+`4*(3*heads*query_tile*256 + 2*kv_heads*key_tile*256 +
+heads*query_tile*key_tile + 3*heads*query_tile)`
 bytes, independent of context length and active request count; excessive
 requests above 256 MiB fail explicitly. For 24 query heads and four KV heads
-this is 63,457,280 bytes. Retained BLAS algorithm workspace is additional and
+this is at most 153,165,824 bytes for prefill/mixed calls and 135,864,608 bytes
+for decode-only calls. Retained BLAS algorithm workspace is additional and
 must be included in the measured memory ledger.
 
 The context ceiling is 262144 tokens including appended queries; page capacity

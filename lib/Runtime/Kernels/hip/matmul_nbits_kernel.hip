@@ -7972,6 +7972,118 @@ extern "C" void hip_matmul_nbits_convert_zp_fp16(
                        N, groups_k, packed_cols);
 }
 
+template <typename Scale, bool AlignedK, int Rows>
+__global__ void matmul_u4_block32_fp32_small_m(
+    const float *__restrict__ activations,
+    const uint8_t *__restrict__ weights,
+    const Scale *__restrict__ scales, const float *__restrict__ bias,
+    float *__restrict__ output, int m, int n, int k) {
+  // Independent 32-lane reductions also partition a wave64 into two channels.
+  constexpr int reduction_width = 32;
+  constexpr int channels_per_block = 256 / reduction_width;
+  const int lane = threadIdx.x % reduction_width;
+  const int64_t channel =
+      static_cast<int64_t>(blockIdx.x) * channels_per_block +
+      threadIdx.x / reduction_width;
+  if (channel >= n)
+    return;
+  const int64_t groups = (static_cast<int64_t>(k) + 31) / 32;
+  const int64_t row = static_cast<int64_t>(blockIdx.y) * Rows;
+  float sums[Rows][4] = {};
+  for (int64_t column = lane * 8; column < k;
+       column += reduction_width * 8) {
+    // Raw byte-typed weights may be caller-bound at an unaligned address.
+    uint32_t packed;
+    __builtin_memcpy(&packed, weights + channel * groups * 16 + column / 2,
+                     sizeof(packed));
+    const float scale = static_cast<float>(scales[channel * groups + column / 32]);
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) {
+      if constexpr (Rows > 1) {
+        if (row + r >= m)
+          continue;
+      }
+      float values[8];
+      if constexpr (AlignedK) {
+        const auto *source = reinterpret_cast<const float4 *>(
+            activations + (row + r) * k + column);
+        const float4 low = source[0];
+        const float4 high = source[1];
+        values[0] = low.x;
+        values[1] = low.y;
+        values[2] = low.z;
+        values[3] = low.w;
+        values[4] = high.x;
+        values[5] = high.y;
+        values[6] = high.z;
+        values[7] = high.w;
+      }
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        if (AlignedK || column + i < k) {
+          const float weight =
+              (static_cast<int>((packed >> (i * 4)) & 15) - 8) * scale;
+          const float value =
+              AlignedK ? values[i] : activations[(row + r) * k + column + i];
+          sums[r][i % 4] = fmaf(value, weight, sums[r][i % 4]);
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < Rows; ++r) {
+    if (Rows == 1 || row + r < m) {
+      float sum = (sums[r][0] + sums[r][1]) + (sums[r][2] + sums[r][3]);
+      for (int offset = reduction_width / 2; offset > 0; offset /= 2)
+        sum += __shfl_down(sum, offset, reduction_width);
+      if (lane == 0)
+        output[(row + r) * n + channel] = sum + (bias ? bias[channel] : 0.0f);
+    }
+  }
+}
+
+extern "C" HIP_KERNEL_API int hip_matmul_nbits_gemv_fp32(
+    void *stream, const float *activations, const void *weights,
+    const void *scales, const float *bias, float *output, int m, int n, int k,
+    int scale_element_size) {
+  if (!stream || !activations || !weights || !scales || !output || m <= 0 ||
+      m > 16 || n <= 0 || k <= 0 ||
+      (scale_element_size != 2 && scale_element_size != 4))
+    return hipErrorInvalidValue;
+  (void)hipGetLastError();
+  const auto launch = [&](auto scale_tag, auto aligned_tag, auto rows_tag) {
+    using Scale = decltype(scale_tag);
+    constexpr bool aligned = decltype(aligned_tag)::value;
+    constexpr int rows = decltype(rows_tag)::value;
+    const dim3 grid((static_cast<int64_t>(n) + 7) / 8, (m + rows - 1) / rows);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(matmul_u4_block32_fp32_small_m<Scale, aligned, rows>),
+        grid, dim3(256), 0, static_cast<hipStream_t>(stream), activations,
+        static_cast<const uint8_t *>(weights),
+        static_cast<const Scale *>(scales), bias, output, m, n, k);
+  };
+  const auto launch_rows = [&](auto scale_tag, auto aligned_tag) {
+    // Two-row sharing regresses full-model decode despite isolated GEMV wins.
+    if (m <= 2)
+      launch(scale_tag, aligned_tag, std::integral_constant<int, 1>{});
+    else
+      launch(scale_tag, aligned_tag, std::integral_constant<int, 4>{});
+  };
+  const bool vector_loads =
+      k % 32 == 0 &&
+      reinterpret_cast<uintptr_t>(activations) % alignof(float4) == 0;
+  if (scale_element_size == 4 && vector_loads) {
+    launch_rows(float{}, std::true_type{});
+  } else if (scale_element_size == 2 && vector_loads) {
+    launch_rows(_Float16{}, std::true_type{});
+  } else if (scale_element_size == 4) {
+    launch_rows(float{}, std::false_type{});
+  } else {
+    launch_rows(_Float16{}, std::false_type{});
+  }
+  return hipGetLastError();
+}
+
 __global__ void dequant_u4_block32_to_fp32(
     const unsigned char *weights, const void *scales, float *output,
     int k, int scale_element_size) {

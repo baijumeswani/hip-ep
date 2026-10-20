@@ -78,15 +78,27 @@ int wrap_paged_attention_int8(
       INT64_MAX / (key_page_size * kv_heads * 256 * cache_components))
     return fail("cache byte extent overflows int64");
 
-  constexpr int query_tile = 64;
-  constexpr int key_tile = 4096;
+  const bool decode = tokens == batch;
+  int query_tile = decode ? 1 : 256;
+  int key_tile = decode ? 16384 : 4096;
+  const auto workspace_elements = [&](int queries, int keys) {
+    return 3 * static_cast<size_t>(heads) * queries * 256 +
+           2 * static_cast<size_t>(kv_heads) * keys * 256 +
+           static_cast<size_t>(heads) * queries * keys +
+           3 * static_cast<size_t>(heads) * queries;
+  };
+  constexpr size_t workspace_limit = 256 * 1024 * 1024;
+  while (query_tile > 64 && workspace_elements(query_tile, key_tile) >
+                                workspace_limit / sizeof(float))
+    query_tile /= 2;
+  while (key_tile > 4096 && workspace_elements(query_tile, key_tile) >
+                                workspace_limit / sizeof(float))
+    key_tile /= 2;
   const size_t query_elements = static_cast<size_t>(heads) * query_tile * 256;
   const size_t cache_elements = static_cast<size_t>(kv_heads) * key_tile * 256;
   const size_t score_elements =
       static_cast<size_t>(heads) * query_tile * key_tile;
-  const size_t statistic_elements = static_cast<size_t>(heads) * query_tile * 3;
-  const size_t elements = 3 * query_elements + 2 * cache_elements +
-                          score_elements + statistic_elements;
+  const size_t elements = workspace_elements(query_tile, key_tile);
   auto *scratch =
       static_cast<float *>(hipdnn_ep_state_ensure_paged_attention_scratch(
           state, elements * sizeof(float)));

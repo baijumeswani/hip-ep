@@ -2539,14 +2539,20 @@ HIP_KERNEL_API void hip_matmul_nbits_convert_scale_fp32_to_fp16(
     void* stream, const void* scale_fp32, void* scale_fp16_out,
     int64_t n_elems);
 
+/* Raw symmetric INT4/block-32, FP32 activations/output/bias, FP16 or FP32
+ * scales. Fused small-M path without expanded-weight scratch. */
+HIP_KERNEL_API int hip_matmul_nbits_gemv_fp32(
+    void *stream, const float *activations, const void *weights,
+    const void *scales, const float *bias, float *output, int m, int n, int k,
+    int scale_element_size);
+HIP_KERNEL_API int hip_matmul_nbits_dequant_b_fp32(
+    void *stream, const void *weights, const void *scales, float *output,
+    int n, int k, int scale_element_size);
 /* Dequantize a full packed int4 weight matrix into row-major fp16 [N, K].
  * Used by the CDNA/wave64 prefill fast path (no WMMA): dequantize B once
  * (weights are constant) then run a hipBLASLt fp16 GEMM. scales_fp16 and
  * zeros_fp16 are fp16 [N, ceil(K/group_size)]; zeros_fp16 may be null (ONNX
  * 4-bit default zero-point 8). */
-HIP_KERNEL_API int hip_matmul_nbits_dequant_b_fp32(
-    void *stream, const void *weights, const void *scales, float *output,
-    int n, int k, int scale_element_size);
 HIP_KERNEL_API void hip_matmul_nbits_dequant_b_fp16(
     void* stream, const void* B_packed, const void* scales_fp16,
     const void* zeros_fp16, void* B_fp16_out, int N, int K, int group_size);

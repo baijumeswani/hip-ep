@@ -106,17 +106,19 @@ static_assert(LargeCapacity(64ull << 20) - (64ull << 20) >= 512 * 4096,
               "one capacity must span 512 tokens of a KV tensor that is "
               "64 MiB at a 16 K context");
 
-// Hand a batch of buffers back to the driver with pool_mutex_ released:
-// hipHostFree unpins pages and is as heavyweight as the hipHostMalloc that
-// pinned them, so holding the lock would serialize every other allocation
-// behind it.
-void ReleaseToDriver(const std::vector<void *> &buffers, int device_id) {
+// Driver frees run outside pool_mutex_ so they do not serialize pool hits.
+void ReleaseToDriver(const std::vector<void *> &buffers, int device_id,
+                     bool host_accessible) {
   if (buffers.empty()) {
     return;
   }
   ScopedDevice _(device_id);
   for (void *p : buffers) {
-    (void)hipHostFree(p);
+    const auto status = host_accessible ? hipHostFree(p) : hipFree(p);
+    if (status != hipSuccess) {
+      LOG(ERROR) << "[MorphiZen HIP] buffer release failed (device "
+                 << device_id << "): " << hipGetErrorString(status);
+    }
   }
 }
 
@@ -142,8 +144,11 @@ int TryGetDeviceId(const OrtMemoryInfo *memory_info) noexcept {
 // =============== HipGpuAllocator ===============
 
 HipGpuAllocator::HipGpuAllocator(const OrtMemoryInfo *memory_info,
-                                 const OrtApi & /*api*/)
-    : memory_info_{memory_info}, device_id_{TryGetDeviceId(memory_info)} {
+                                 const OrtApi &api)
+    : memory_info_{memory_info}, device_id_{TryGetDeviceId(memory_info)},
+      host_accessible_{memory_info &&
+                       api.MemoryInfoGetDeviceMemType(memory_info) ==
+                           OrtDeviceMemoryType_HOST_ACCESSIBLE} {
   version = NegotiatedOrtApiVersion();
   Alloc = AllocImpl;
   Free = FreeImpl;
@@ -291,28 +296,18 @@ void *ORT_API_CALL HipGpuAllocator::AllocImpl(OrtAllocator *this_,
       self->TrimLarge(stale);
     }
   }
-  ReleaseToDriver(stale, self->device_id_);
+  ReleaseToDriver(stale, self->device_id_, self->host_accessible_);
 
   ScopedDevice _(self->device_id_);
 
-  // On AMD APU iGPU (the only hardware MorphiZen EP currently targets) the
-  // GPU shares physical memory with the CPU, so we use hipHostMalloc(Mapped)
-  // for both DEFAULT and HOST_ACCESSIBLE OrtMemoryInfos: the same pointer is
-  // dereferenceable from CPU and GPU. (hipMalloc would return a GPU-only
-  // virtual address that the host cannot deref, which crashes OGA's KV
-  // cache zero-init.)
-  //
-  // TODO(discrete-gpu): on a discrete AMD GPU (PCIe), DEFAULT memory should
-  // be hipMalloc'd into VRAM for locality + to avoid the host coherency
-  // traffic. HOST_ACCESSIBLE should keep using hipHostMalloc(Mapped). To
-  // do that we need to (a) read OrtMemoryInfoGetMemType from memory_info_
-  // and branch here, and (b) update OGA's MorphiZenEP::Memory struct to
-  // stop aliasing p_cpu_ = p_device_ and instead route Zero / CopyDeviceToCpu
-  // / CopyCpuToDevice through the HIP runtime. Tracked separately because
-  // the OGA-side change cuts across the smartptrs / DeviceBuffer abstraction.
   void *ptr = nullptr;
-  hipError_t err = hipHostMalloc(&ptr, alloc_size,
-                                 hipHostMallocMapped | hipHostMallocCoherent);
+  const auto allocate = [&] {
+    return self->host_accessible_
+               ? hipHostMalloc(&ptr, alloc_size,
+                               hipHostMallocMapped | hipHostMallocCoherent)
+               : hipMalloc(&ptr, alloc_size);
+  };
+  hipError_t err = allocate();
   if (err != hipSuccess) {
     // The large pool may be sitting on pinned pages this allocation could use,
     // and failing while holding reclaimable memory would be worse than not
@@ -323,15 +318,15 @@ void *ORT_API_CALL HipGpuAllocator::AllocImpl(OrtAllocator *this_,
       self->DrainLarge(drained);
     }
     if (!drained.empty()) {
-      ReleaseToDriver(drained, self->device_id_);
-      err = hipHostMalloc(&ptr, alloc_size,
-                          hipHostMallocMapped | hipHostMallocCoherent);
+      ReleaseToDriver(drained, self->device_id_, self->host_accessible_);
+      err = allocate();
     }
   }
   if (err != hipSuccess) {
-    LOG(ERROR) << "[MorphiZen HIP] hipHostMalloc(Mapped|Coherent) failed for "
-               << alloc_size << " bytes (device " << self->device_id_
-               << "): " << hipGetErrorString(err);
+    LOG(ERROR) << "[MorphiZen HIP] "
+               << (self->host_accessible_ ? "hipHostMalloc" : "hipMalloc")
+               << " failed for " << alloc_size << " bytes (device "
+               << self->device_id_ << "): " << hipGetErrorString(err);
     return nullptr;
   }
   {
@@ -355,8 +350,8 @@ void ORT_API_CALL HipGpuAllocator::FreeImpl(OrtAllocator *this_, void *p) {
     std::lock_guard<std::mutex> lk(self->pool_mutex_);
     auto it = self->ptr_to_size_.find(p);
     if (it == self->ptr_to_size_.end()) {
-      // Defensive: a pointer we never handed out. Release rather than leak.
-      to_release.push_back(p);
+      LOG(ERROR) << "[MorphiZen HIP] refusing to free an unowned pointer";
+      return;
     } else if (const int cls = SizeClassIndex(it->second); cls >= 0) {
       // Pooled small/medium buffer (<= 16 MB): return to its free list for
       // reuse; do NOT release to the driver here. Stays tracked in
@@ -398,20 +393,21 @@ void ORT_API_CALL HipGpuAllocator::FreeImpl(OrtAllocator *this_, void *p) {
       }
     }
   }
-  ReleaseToDriver(to_release, self->device_id_);
+  ReleaseToDriver(to_release, self->device_id_, self->host_accessible_);
 }
 
 HipGpuAllocator::~HipGpuAllocator() {
-  // Release every pinned buffer the pool ever allocated. By teardown ORT has
+  // Release every buffer the pool ever allocated. By teardown ORT has
   // freed all outstanding tensors (they are back on free_lists_), but we walk
   // ptr_to_size_ rather than free_lists_ so any still-checked-out buffer is
   // also released instead of leaked.
   ScopedDevice _(device_id_);
   std::lock_guard<std::mutex> lk(pool_mutex_);
   for (const auto &kv : ptr_to_size_) {
-    hipError_t err = hipHostFree(kv.first);
+    hipError_t err =
+        host_accessible_ ? hipHostFree(kv.first) : hipFree(kv.first);
     if (err != hipSuccess) {
-      LOG(WARNING) << "[MorphiZen HIP] hipHostFree failed (device "
+      LOG(WARNING) << "[MorphiZen HIP] buffer release failed (device "
                    << device_id_ << "): " << hipGetErrorString(err);
     }
   }

@@ -52,17 +52,107 @@ def w4a16_weights(request):
 def unpack_weight(packed, scales, k, n):
     data = numpy_helper.to_array(packed)
     scale = numpy_helper.to_array(scales).reshape(n, -1, 1).astype(np.float32)
-    assert data.shape == (n, k // 32, 16) and scale.shape == (n, k // 32, 1)
-    nibbles = np.stack((data & 15, data >> 4), axis=-1).reshape(n, k // 32, 32)
-    return ((nibbles.astype(np.float32) - 8) * scale).reshape(n, k)
+    groups = (k + 31) // 32
+    assert data.shape == (n, groups, 16) and scale.shape == (n, groups, 1)
+    nibbles = np.stack((data & 15, data >> 4), axis=-1).reshape(n, groups, 32)
+    return ((nibbles.astype(np.float32) - 8) * scale).reshape(n, -1)[:, :k]
+
+
+def test_qwen_w4a16_runtime_error_reaches_caller(w4a16_weights, request):
+    weights, device, _ = w4a16_weights
+    k = n = 896
+    packed, scales = weights[k, n]
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "MatMulNBits",
+                ["X", packed.name, scales.name, "", "g_idx"],
+                ["Y"],
+                domain="com.microsoft",
+                K=k,
+                N=n,
+                bits=4,
+                block_size=32,
+            )
+        ],
+        "qwen_w4a16_unsupported_g_idx",
+        [
+            helper.make_tensor_value_info("X", TensorProto.FLOAT16, ["rows", k]),
+            helper.make_tensor_value_info("g_idx", TensorProto.INT32, [k]),
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT16, ["rows", n])],
+        initializer=[packed, scales],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[
+            helper.make_opsetid("", 21),
+            helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 2
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    options.add_provider_for_devices(
+        [device], _parse_ep_options(request.config.getoption("--ep-option"))
+    )
+    session = ort.InferenceSession(model.SerializeToString(), sess_options=options)
+    memory = device.memory_info(ort.OrtDeviceMemoryType.DEFAULT)
+    source = np.ones((1, k), dtype=np.float16)
+    groups = np.arange(k, dtype=np.int32) // 32
+    inputs = []
+    binding = session.io_binding()
+    for name, data in (("X", source), ("g_idx", groups)):
+        value = ort.OrtValue.ortvalue_from_shape_and_type(
+            data.shape, data.dtype, memory_info=memory
+        )
+        value.update_inplace(data)
+        inputs.append(value)
+        binding.bind_ortvalue_input(name, value)
+    output = ort.OrtValue.ortvalue_from_shape_and_type(
+        (1, n), np.float16, memory_info=memory
+    )
+    output.update_inplace(np.full((1, n), np.nan, dtype=np.float16))
+    binding.bind_ortvalue_output("Y", output)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="inference_compute .* failed"):
+            session.run_with_iobinding(binding)
+        assert np.isnan(output.numpy()).all()
+        np.testing.assert_array_equal(inputs[0].numpy(), source)
+        np.testing.assert_array_equal(inputs[1].numpy(), groups)
+    del binding, output, value, inputs, session, options
+    gc.collect()
 
 
 @pytest.mark.parametrize(
-    "k,n", [(896, 1152), (896, 896), (896, 4864), (4864, 896), (896, 151936)]
+    "dtype,k,n",
+    [
+        (dtype, k, n)
+        for dtype in (np.float16, np.float32)
+        for k, n in ((896, 1152), (896, 896), (896, 4864), (4864, 896), (896, 151936))
+    ]
+    + [(np.float32, 883, 263)],
 )
-def test_qwen_w4a16_dynamic_shapes(w4a16_weights, request, tmp_path, k, n):
+def test_qwen_w4a16_dynamic_shapes(w4a16_weights, request, tmp_path, dtype, k, n):
     weights, device, provider = w4a16_weights
-    packed, scales = weights[k, n]
+    if k % 32:
+        packed, scales = weights[896, 896]
+        packed = numpy_helper.from_array(
+            numpy_helper.to_array(packed)[:n, : (k + 31) // 32].copy(), packed.name
+        )
+        scales = numpy_helper.from_array(
+            numpy_helper.to_array(scales).reshape(896, -1)[:n, : (k + 31) // 32].copy(),
+            scales.name,
+        )
+    else:
+        packed, scales = weights[k, n]
+    if dtype == np.float32:
+        scales = numpy_helper.from_array(
+            numpy_helper.to_array(scales).astype(np.float32) * np.float32(1.000123),
+            scales.name,
+        )
+    activation = helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
     dense = unpack_weight(packed, scales, k, n)
     graph = helper.make_graph(
         [
@@ -78,8 +168,8 @@ def test_qwen_w4a16_dynamic_shapes(w4a16_weights, request, tmp_path, k, n):
             )
         ],
         "qwen_w4a16",
-        [helper.make_tensor_value_info("X", TensorProto.FLOAT16, ["rows", k])],
-        [helper.make_tensor_value_info("Y", TensorProto.FLOAT16, ["rows", n])],
+        [helper.make_tensor_value_info("X", activation, ["rows", k])],
+        [helper.make_tensor_value_info("Y", activation, ["rows", n])],
         initializer=[packed, scales],
     )
     model = helper.make_model(
@@ -104,18 +194,21 @@ def test_qwen_w4a16_dynamic_shapes(w4a16_weights, request, tmp_path, k, n):
     rng = np.random.default_rng(27)
     # Revisit both dispatch sides after changing M, on the same compiled graph.
     for rows in (1, 2, 7, 8, 16, 128, 7, 16, 1, 128):
-        source = rng.uniform(-1, 1, (rows, k)).astype(np.float16)
+        source = rng.uniform(-1, 1, (rows, k)).astype(dtype)
         expected = source.astype(np.float32) @ dense.T
         actual = session.run(None, {"X": source})[0].astype(np.float32)
         assert np.isfinite(actual).all()
         difference = actual - expected
-        np.testing.assert_array_less(
-            np.abs(difference), 0.02 + 0.003 * np.abs(expected)
-        )
+        if dtype == np.float32:
+            np.testing.assert_allclose(actual, expected, atol=0.00003, rtol=0.00002)
+        else:
+            np.testing.assert_array_less(
+                np.abs(difference), 0.02 + 0.003 * np.abs(expected)
+            )
         normalized_rms = np.sqrt(np.mean(difference.astype(np.float64) ** 2)) / max(
             np.sqrt(np.mean(expected.astype(np.float64) ** 2)), 1e-12
         )
-        assert normalized_rms <= 0.003
+        assert normalized_rms <= (0.000002 if dtype == np.float32 else 0.003)
     events = json.loads(Path(session.end_profiling()).read_text())
     assigned = {
         event["args"]["provider"]

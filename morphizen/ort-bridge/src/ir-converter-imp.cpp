@@ -614,7 +614,7 @@ static std::string get_attr_value_string(const OrtApi &ort_api,
         attr, OrtOpAttrType::ORT_OP_ATTR_STRING, chars.data(), out, &out));
     return chars;
   } else {
-    return {c};
+    return std::string(&c, out);
   }
 }
 static std::vector<std::string> get_attr_value_strings(const OrtApi &ort_api,

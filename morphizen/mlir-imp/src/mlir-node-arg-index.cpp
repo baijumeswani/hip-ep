@@ -156,7 +156,7 @@ int MLIRNodeArgIndex::external_location(std::string &external_file,
     offset = ext->offset;
     size = ext->size;
     checksum = 0;
-    return 0;
+    return 1;
   }
 
   // Stage 2: post-materialization — info embedded in onnx.Constant attributes
@@ -164,21 +164,21 @@ int MLIRNodeArgIndex::external_location(std::string &external_file,
   if (val) {
     if (auto defining_op = val.getDefiningOp()) {
       if (defining_op->getName().getStringRef() != "onnx.Constant")
-        return -1;
+        return 0;
       auto loc_attr = defining_op->getAttrOfType<mlir::StringAttr>("location");
       if (!loc_attr)
-        return -1;
+        return 0;
       external_file = loc_attr.getValue().str();
       if (auto off = defining_op->getAttrOfType<mlir::IntegerAttr>("offset"))
         offset = static_cast<size_t>(off.getInt());
       if (auto sz = defining_op->getAttrOfType<mlir::IntegerAttr>("size"))
         size = static_cast<size_t>(sz.getInt());
       checksum = 0;
-      return 0;
+      return 1;
     }
   }
 
-  return -1;
+  return 0;
 }
 
 const std::string &MLIRNodeArgIndex::get_name() const {

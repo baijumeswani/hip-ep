@@ -7972,6 +7972,39 @@ extern "C" void hip_matmul_nbits_convert_zp_fp16(
                        N, groups_k, packed_cols);
 }
 
+__global__ void dequant_u4_block32_to_fp32(
+    const unsigned char *weights, const void *scales, float *output,
+    int k, int scale_element_size) {
+  const int64_t column = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (column >= k)
+    return;
+  const int64_t row = blockIdx.y;
+  const int64_t groups = (static_cast<int64_t>(k) + 31) / 32;
+  const int64_t group = row * groups + column / 32;
+  const unsigned char packed = weights[group * 16 + (column % 32) / 2];
+  const int value = ((column & 1) ? packed >> 4 : packed & 15) - 8;
+  const float scale = scale_element_size == 4
+                          ? static_cast<const float *>(scales)[group]
+                          : static_cast<float>(static_cast<const _Float16 *>(scales)[group]);
+  output[row * k + column] = value * scale;
+}
+
+extern "C" HIP_KERNEL_API int hip_matmul_nbits_dequant_b_fp32(
+    void *stream, const void *weights, const void *scales, float *output,
+    int n, int k, int scale_element_size) {
+  if (!stream || !weights || !scales || !output || n <= 0 || n > 65535 ||
+      k <= 0 || (scale_element_size != 2 && scale_element_size != 4))
+    return hipErrorInvalidValue;
+  (void)hipGetLastError();
+  hipLaunchKernelGGL(
+      dequant_u4_block32_to_fp32,
+      dim3((static_cast<int64_t>(k) + 255) / 256, n), dim3(256), 0,
+      static_cast<hipStream_t>(stream),
+      static_cast<const unsigned char *>(weights), scales, output, k,
+      scale_element_size);
+  return hipGetLastError();
+}
+
 // Full-weight int4 -> fp16 dequantization into a row-major [N, K] buffer, used
 // by the CDNA/wave64 prefill fast path (lib/Runtime/real/matmul_nbits.cpp),
 // which lacks WMMA and instead dequantizes B once (weights are constant) and

@@ -74,9 +74,13 @@ struct RuntimeState {
 
   // Reused by serialized MatMulNBits prefill ops on this session's stream.
   // Separate from the hipBLASLt workspace, which may grow during GEMM tuning.
-  // Holds only the largest expanded FP16 matrix, not every layer's weights.
+  // Holds the largest expanded FP16 matrix or bounded FP32 tile, not every
+  // layer.
   void *matmul_nbits_fp16_scratch;
   size_t matmul_nbits_fp16_scratch_size;
+
+  void *paged_attention_scratch;
+  size_t paged_attention_scratch_size;
 
   // Host-mapped scratch buffer for tiny host-fed scalars routed away from the
   // GPU pool by hip-materialize-host-scalars.
@@ -345,5 +349,7 @@ struct RuntimeState {
 const void *hipdnn_ep_dequant_matmul_nbits_fp16(
     RuntimeState *state, void *stream, const void *weights, const void *scales,
     const void *zeros, int n, int k, int group_size);
+void *hipdnn_ep_state_ensure_matmul_nbits_scratch(RuntimeState *state,
+                                                  void *stream, size_t bytes);
 
 #endif // HIPDNN_EP_RUNTIME_STATE_INTERNAL_H

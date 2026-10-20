@@ -47,6 +47,7 @@ struct CompilationArtifact {
   std::string filename;
   std::vector<uint8_t> bytes;
   ArtifactFormat format;
+  std::vector<std::string> dependencyFilenames;
 };
 
 /**

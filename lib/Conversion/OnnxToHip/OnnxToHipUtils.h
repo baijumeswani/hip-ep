@@ -347,6 +347,8 @@ void populateNormConversionPatterns(RewritePatternSet &patterns,
                                     MLIRContext *ctx);
 void populatePagedAttentionConversionPatterns(RewritePatternSet &patterns,
                                               MLIRContext *ctx);
+void populateQwenHybridConversionPatterns(RewritePatternSet &patterns,
+                                          MLIRContext *ctx);
 void populateRotaryEmbeddingConversionPatterns(RewritePatternSet &patterns,
                                                MLIRContext *ctx);
 void populateOnnxRotaryEmbeddingConversionPatterns(RewritePatternSet &patterns,

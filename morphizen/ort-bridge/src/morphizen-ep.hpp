@@ -7,6 +7,7 @@
 #include "./ir-converter.hpp"
 #include "morphizen/custom_op.h" // in onnxruntime/core/providers/morphizen/include
 #include "morphizen/morphizen-ort-api-ext.hpp"
+#include "morphizen/onnxruntime_api.hpp"
 #include <map>
 
 namespace onnxruntime {
@@ -108,6 +109,7 @@ private:
   using my_ep_uptr_t = std::shared_ptr<my_ep_t>;
   // we have to hide the implementation by forward declaration.
   mutable my_ep_uptr_t execution_providers_;
+  Ort::Status compilation_error_{nullptr};
   std::unordered_map<std::string, std::string> provider_options_;
   std::map<std::string, std::string> session_configs_;
   bool enable_ep_context_;

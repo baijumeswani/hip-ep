@@ -10,7 +10,7 @@ module {
                       %table: tensor<1x1xi32>, %rope: tensor<256x32xf16>)
       -> (tensor<2x64xf16>, tensor<1x256x1x64xf16>, tensor<1x256x1x64xf16>) {
     %none = "onnx.NoValue"() {value} : () -> none
-    // expected-error @+1 {{requires grouped heads, full causal attention and non-interleaved fused RoPE}}
+    // expected-error @+1 {{requires grouped heads, full causal attention}}
     %result:3 = "onnx.Custom"(%query, %none, %none, %cache, %cache, %cu, %past, %table, %rope, %rope)
         {function_name = "PagedAttention", domain_name = "com.microsoft",
          num_heads = 1 : si64, kv_num_heads = 1 : si64,

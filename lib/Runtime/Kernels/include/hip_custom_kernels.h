@@ -47,6 +47,56 @@
 extern "C" {
 #endif
 
+HIP_KERNEL_API int hip_varlen_causal_conv(
+    void *stream, const void *input, const void *weight,
+    const int32_t *cumulative, const void *bias, const void *past,
+    void *output, void *present, int64_t tokens, int64_t batch,
+    int64_t channels, void *error_flag, int64_t input_dtype);
+HIP_KERNEL_API int hip_gated_delta_net(
+    void *stream, const void *query, const void *key, const void *value,
+    const int32_t *cumulative, const float *decay, const float *beta,
+    const float *past, const float *a_log, const float *dt_bias,
+    void *output, float *present, int64_t tokens, int64_t batch,
+    int64_t key_heads, int64_t value_heads, float scale, void *error_flag, int64_t input_dtype);
+HIP_KERNEL_API int hip_gated_rms_norm(
+    void *stream, const void *input, const void *weight, const void *gate,
+    void *output, int64_t rows, int64_t width, float epsilon, void *error_flag,
+    int64_t input_dtype);
+HIP_KERNEL_API int hip_mrotary_embedding_fp32(
+    void *stream, const float *input, const int64_t *positions,
+    const float *cos_cache, const float *sin_cache, float *output,
+    int64_t tokens, int64_t cache_length, int64_t heads, void *error_flag);
+HIP_KERNEL_API int hip_paged_attention_separate(
+    void *stream, const void *query, const void *key, const void *value,
+    void *key_cache, void *value_cache, const int32_t *cumulative,
+    const int32_t *past_lengths, const int32_t *table, void *output,
+    int64_t tokens, int64_t batch, int64_t table_columns, int64_t blocks,
+    int64_t page_size, int64_t heads, int64_t kv_heads, float scale,
+    void *error_flag, int64_t input_dtype);
+
+HIP_KERNEL_API int hip_paged_int8_append(
+    void *stream, const float *key, const float *value, int8_t *key_cache,
+    int8_t *value_cache, const int32_t *cumulative, const int32_t *past,
+    const int32_t *table, const float *key_scale, const float *value_scale,
+    int tokens, int batch, int columns, int blocks, int page_size, int kv_heads,
+    int *error, int residual_bits);
+HIP_KERNEL_API int hip_paged_int8_pack_query(
+    void *stream, const float *query, float *packed, int queries, int heads,
+    int kv_heads, int *error);
+HIP_KERNEL_API int hip_paged_int8_pack_cache(
+    void *stream, const int8_t *key_cache, const int8_t *value_cache,
+    const int32_t *table, const float *key_scale, const float *value_scale,
+    float *key, float *value, int begin, int count, int page_size, int kv_heads,
+    int *error, int residual_bits);
+HIP_KERNEL_API int hip_paged_int8_softmax(
+    void *stream, float *scores, float *statistics, int queries, int keys,
+    int heads, int kv_heads, int query_position, int key_position, float scale,
+    int *error);
+HIP_KERNEL_API int hip_paged_int8_merge(
+    void *stream, const float *partial, float *accumulator,
+    const float *statistics, float *output, int queries, int heads,
+    int kv_heads, int first, int last, int *error);
+
 /* =========================================================================
  * Data Type Enum
  * =========================================================================
@@ -2494,6 +2544,9 @@ HIP_KERNEL_API void hip_matmul_nbits_convert_scale_fp32_to_fp16(
  * (weights are constant) then run a hipBLASLt fp16 GEMM. scales_fp16 and
  * zeros_fp16 are fp16 [N, ceil(K/group_size)]; zeros_fp16 may be null (ONNX
  * 4-bit default zero-point 8). */
+HIP_KERNEL_API int hip_matmul_nbits_dequant_b_fp32(
+    void *stream, const void *weights, const void *scales, float *output,
+    int n, int k, int scale_element_size);
 HIP_KERNEL_API void hip_matmul_nbits_dequant_b_fp16(
     void* stream, const void* B_packed, const void* scales_fp16,
     const void* zeros_fp16, void* B_fp16_out, int N, int K, int group_size);

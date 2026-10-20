@@ -39,6 +39,7 @@ set(_kernel_sources
     hip/rope_kernel.hip
     hip/gqa_kernel.hip
     hip/paged_attention_kernel.hip
+    hip/qwen_hybrid_kernel.hip
     hip/multi_head_attention_kernel.hip
     hip/gemm_wmma_kernel.hip
     hip/elementwise_sub_kernel.hip

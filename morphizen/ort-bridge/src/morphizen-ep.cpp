@@ -298,8 +298,7 @@ OrtStatus *ORT_API_CALL MorphiZenEP::GetCapabilityImpl(
   }
   // Use the OrtGraphWrapper class instead of manual API calls
   auto graph_wrapper = morphizen::OrtGraphWrapper(*self, *graph);
-  self->GetCapability(graph_wrapper, *graph_support_info);
-  return nullptr;
+  return self->GetCapability(graph_wrapper, *graph_support_info);
 }
 
 OrtStatus *ORT_API_CALL MorphiZenEP::CompileImpl(
@@ -428,14 +427,27 @@ MorphiZenEP::GetCapability(OrtGraphWrapper &graph_viewer,
           },
           &logger_));
 
+  OrtNodeFusionOptions node_fusion_options = {};
+  node_fusion_options.ort_version_supported = NegotiatedOrtApiVersion();
+  node_fusion_options.drop_constant_initializers = true;
+  if (status != nullptr) {
+    execution_providers_.reset();
+    // ORT treats GetCapability errors as unsupported graphs. Defer a hard
+    // compilation failure to Compile so an incompatible artifact cannot fall
+    // back to another EP, even when CPU fallback is enabled.
+    compilation_error_ = Ort::Status(status);
+    const auto nodes = graph_viewer.nodes();
+    if (nodes.empty()) {
+      return compilation_error_.release();
+    }
+    return ep_api.EpGraphSupportInfo_AddNodesToFuse(
+        &graph_support_info, nodes.data(), nodes.size(), &node_fusion_options);
+  }
   if (!execution_providers_) {
     MY_LOG(1) << "Failed to compile ONNX model to MorphiZen EP.";
     return nullptr;
   }
   // iterator over the execution providers and set the graph support info
-  OrtNodeFusionOptions node_fusion_options = {};
-  node_fusion_options.ort_version_supported = NegotiatedOrtApiVersion();
-  node_fusion_options.drop_constant_initializers = true;
   auto supported_node_groups = std::vector<std::vector<const OrtNode *>>();
   for (auto &ep : **execution_providers_) {
     CHECK(ep.get() != nullptr);
@@ -515,6 +527,9 @@ OrtStatus *MorphiZenEP::Compile(const OrtGraph **graphs,
                                 const OrtNode **fused_nodes, size_t count,
                                 OrtNodeComputeInfo **node_compute_infos,
                                 OrtNode **ep_context_nodes) {
+  if (compilation_error_) {
+    return compilation_error_.release();
+  }
   CHECK(execution_providers_ != nullptr)
       << "Execution providers are not initialized.";
   CHECK_EQ((*execution_providers_)->size(), count)

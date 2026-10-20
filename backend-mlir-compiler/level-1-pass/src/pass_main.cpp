@@ -3,6 +3,7 @@
  * Licensed under the MIT License.
  */
 
+#include "../../common/artifact_manifest.hpp"
 #include "MlirCompiler.h"
 #include "hip/Compiler/RocMlirArtifactTarget.h"
 
@@ -162,7 +163,7 @@ static int64_t normalizeDim(int64_t dim) {
 // the DLL sizes dynamic outputs in-graph at runtime via the output-allocator
 // callback.
 static std::string build_metadata_json(const CompilationArtifact &artifact,
-                                       Graph &graph) {
+                                       Graph &graph, PassContext &context) {
   mlir_metadata::Metadata metadata;
   metadata.set_artifact_filename(artifact.filename);
   // Record the artifact format so the EP picks the matching loader before it
@@ -173,6 +174,23 @@ static std::string build_metadata_json(const CompilationArtifact &artifact,
   // Same process and env as the compile that just ran, so this is the arch
   // CompilerDriver embedded rocMLIR kernels for (empty if it did not).
   metadata.set_rocmlir_arch(hip::compiler::rocMlirArtifactTarget());
+  const auto compatibility = mlir_compilation::artifactCompatibility(context);
+  metadata.mutable_compatibility()->insert(compatibility.begin(),
+                                           compatibility.end());
+  metadata.set_source_model_sha256(
+      context.get_context_proto().source_model_sha256());
+  metadata.set_artifact_sha256(mlir_compilation::artifactSha256(
+      artifact.bytes.data(), artifact.bytes.size()));
+  metadata.set_external_dependency_count(artifact.dependencyFilenames.size());
+  for (const auto &filename : artifact.dependencyFilenames) {
+    auto reader = context.open_file_for_read(filename);
+    if (!reader) {
+      throw ArtifactCompatibilityError(
+          "Compiled HIP artifact is missing its externalized constants.");
+    }
+    (*metadata.mutable_file_sha256())[filename] =
+        mlir_compilation::artifactFileSha256(*reader);
+  }
 
   GraphRef graphRef(graph);
 
@@ -334,7 +352,8 @@ struct Level1MlirPass {
                record_elapsed(t_prev));
 
     // Step 5: Build metadata JSON from graph outputs
-    auto metadata_json = build_metadata_json(artifact, graph);
+    auto metadata_json =
+        build_metadata_json(artifact, graph, *self.get_context());
 
     TIMING_LOG("[Session] Build metadata JSON: %.3fs\n",
                record_elapsed(t_prev));

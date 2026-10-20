@@ -60,6 +60,10 @@ message ContextProto {
   reserved "cache_files";
   string cache_key = 13; // Cache namespace prefix for shared context scenarios
   AllVersionInfoProto version = 14; // Compiler version info (output metadata)
+  // Source ONNX bytes and referenced initializer contents, hashed once when
+  // preparing a reusable compilation. Never derived from output shapes alone.
+  string source_model_sha256 = 15;
+  string compilation_session_sha256 = 16;
 }
 /*
 {

@@ -265,6 +265,7 @@ macro(compile_to_bitcode SOURCE_FILE OUTPUT_BC)
                 -o ${CMAKE_CURRENT_BINARY_DIR}/${OUTPUT_BC}
         DEPENDS ${SOURCE_FILE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/hipdnn_ep_runtime.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/execution_status.h
                 ${CMAKE_SOURCE_DIR}/include/hip/datatype_abi.h
                 ${CMAKE_SOURCE_DIR}/include/hip/init_config_abi.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/runtime_state_internal.h
@@ -321,6 +322,7 @@ if(NOT BUILD_MOCK_RUNTIME)
     compile_to_bitcode(real/rotary_embedding.cpp runtime_rotary_embedding.bc)
     compile_to_bitcode(real/gqa.cpp runtime_gqa.bc)
     compile_to_bitcode(real/paged_attention.cpp runtime_paged_attention.bc)
+    compile_to_bitcode(real/qwen_hybrid.cpp runtime_qwen_hybrid.bc)
     compile_to_bitcode(real/cast.cpp runtime_cast.bc)
     compile_to_bitcode(real/range.cpp runtime_range.bc)
     compile_to_bitcode(real/gather.cpp runtime_gather.bc)
@@ -424,6 +426,7 @@ if(NOT BUILD_MOCK_RUNTIME)
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_rotary_embedding.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_gqa.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_paged_attention.bc
+        ${CMAKE_CURRENT_BINARY_DIR}/runtime_qwen_hybrid.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_cast.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_range.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_gather.bc

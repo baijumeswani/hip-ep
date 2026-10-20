@@ -1429,6 +1429,31 @@ int wrap_global_pool(RuntimeState *state, void *input, void *output,
 // without position_ids ships cos/sin already position-expanded to
 // [batch, seq_len, rotary_dim/2], and the kernel indexes them by the flat
 // token position b*seq+s instead of looking up position_ids.
+int wrap_varlen_causal_conv(RuntimeState *state, void *input, void *weight,
+                            void *cumulative, void *bias, void *past,
+                            void *output, void *present, int64_t tokens,
+                            int64_t output_tokens, int64_t cumulative_count,
+                            int64_t batch, int64_t present_batch,
+                            int64_t channels, int64_t input_dtype);
+int wrap_gated_delta_net(RuntimeState *state, void *query, void *key,
+                         void *value, void *cumulative, void *decay, void *beta,
+                         void *past, void *a_log, void *dt_bias, void *output,
+                         void *present, int64_t tokens, int64_t key_tokens,
+                         int64_t value_tokens, int64_t decay_tokens,
+                         int64_t beta_tokens, int64_t cumulative_count,
+                         int64_t batch, int64_t present_batch,
+                         int64_t output_tokens, int64_t key_heads,
+                         int64_t value_heads, float scale, int64_t input_dtype);
+int wrap_gated_rms_norm(RuntimeState *state, void *input, void *weight,
+                        void *gate, void *output, int64_t rows,
+                        int64_t gate_rows, int64_t output_rows, int64_t width,
+                        float epsilon, int64_t input_dtype);
+int wrap_mrotary_embedding(RuntimeState *state, void *input, void *positions,
+                           void *cos_cache, void *sin_cache, void *output,
+                           int64_t tokens, int64_t position_tokens,
+                           int64_t cos_length, int64_t sin_length,
+                           int64_t output_tokens, int64_t heads);
+
 int wrap_paged_attention(RuntimeState *state, void *query, void *past_key,
                          void *past_value, void *cumulative_lengths,
                          void *past_lengths, void *block_table, void *cos_cache,
@@ -1440,6 +1465,33 @@ int wrap_paged_attention(RuntimeState *state, void *query, void *past_key,
                          int64_t cumulative_count, int64_t table_rows,
                          int64_t value_blocks, int64_t value_block_size,
                          int64_t sin_length, float scale);
+
+int wrap_paged_attention_separate(
+    RuntimeState *state, void *query, void *key, void *value, void *past_key,
+    void *past_value, void *cumulative, void *past_lengths, void *table,
+    void *output, void *present_key, void *present_value, int64_t tokens,
+    int64_t key_tokens, int64_t value_tokens, int64_t output_tokens,
+    int64_t batch, int64_t cumulative_count, int64_t table_rows,
+    int64_t table_columns, int64_t key_blocks, int64_t key_page_size,
+    int64_t value_blocks, int64_t value_page_size, int64_t present_key_blocks,
+    int64_t present_key_page_size, int64_t present_value_blocks,
+    int64_t present_value_page_size, int64_t heads, int64_t kv_heads,
+    float scale, int64_t input_dtype);
+
+void *hipdnn_ep_state_ensure_paged_attention_scratch(RuntimeState *state,
+                                                     size_t bytes);
+int wrap_paged_attention_int8(
+    RuntimeState *state, int op_state_slot, void *query, void *key, void *value,
+    void *past_key, void *past_value, void *cumulative, void *past_lengths,
+    void *table, void *key_scale, void *value_scale, void *output,
+    void *present_key, void *present_value, int64_t tokens, int64_t key_tokens,
+    int64_t value_tokens, int64_t output_tokens, int64_t batch,
+    int64_t cumulative_count, int64_t table_rows, int64_t table_columns,
+    int64_t key_blocks, int64_t key_page_size, int64_t value_blocks,
+    int64_t value_page_size, int64_t present_key_blocks,
+    int64_t present_key_page_size, int64_t present_value_blocks,
+    int64_t present_value_page_size, int64_t heads, int64_t kv_heads,
+    float scale, int64_t residual_bits);
 
 int wrap_rotary_embedding(RuntimeState *state, void *input, void *position_ids,
                           void *cos_cache, void *sin_cache, void *output,

@@ -2355,6 +2355,66 @@ MutableOperandRange PagedAttentionOp::getDpsInitsMutable() {
   return MutableOperandRange(*this, 9, 3);
 }
 
+MutableOperandRange PagedAttentionSeparateOp::getDpsInitsMutable() {
+  return MutableOperandRange(*this, 9, 3);
+}
+
+MutableOperandRange PagedAttentionInt8Op::getDpsInitsMutable() {
+  return MutableOperandRange(*this, 11, 3);
+}
+
+void PagedAttentionInt8Op::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+void PagedAttentionSeparateOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+MutableOperandRange VarlenCausalConvOp::getDpsInitsMutable() {
+  return MutableOperandRange(*this, 6, 2);
+}
+
+void VarlenCausalConvOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+MutableOperandRange GatedDeltaNetOp::getDpsInitsMutable() {
+  return MutableOperandRange(*this, 10, 2);
+}
+
+void GatedDeltaNetOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+MutableOperandRange GatedRmsNormOp::getDpsInitsMutable() {
+  return MutableOperandRange(*this, 4, 1);
+}
+
+void GatedRmsNormOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+MutableOperandRange MRotaryEmbeddingOp::getDpsInitsMutable() {
+  return MutableOperandRange(*this, 5, 1);
+}
+
+void MRotaryEmbeddingOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
 void PagedAttentionOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {

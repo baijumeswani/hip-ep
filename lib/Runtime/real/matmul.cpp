@@ -3,6 +3,7 @@
  * Licensed under the MIT License.
  */
 #include "../debug_log.h"
+#include "../execution_status.h"
 #include "../hipdnn_ep_runtime.h"
 #include "../op_profile.h"
 #include "../op_state.h"
@@ -454,6 +455,7 @@ int wrap_hipblasLtMatmul(RuntimeState *state, int op_state_slot, const void *A,
                          int64_t K, int64_t batch_count, int64_t elem_size,
                          int64_t b_batch_stride, int64_t transA,
                          int64_t transB) {
+  ExecutionStatusGuard execution_status(state);
   OP_PROFILE(
       "matmul",
       [&] {
@@ -563,5 +565,5 @@ int wrap_hipblasLtMatmul(RuntimeState *state, int op_state_slot, const void *A,
   }
 
   RUNTIME_DEBUG_LOG("[REAL] wrap_hipblasLtMatmul: completed successfully\n");
-  return 0;
+  return execution_status.Finish(0);
 }

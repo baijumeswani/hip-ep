@@ -3732,6 +3732,120 @@ def Hip_CausalConvWithStateOp : Hip_DpsOp<"causal_conv_with_state",
 
 // ===== Group Query Attention =================================================
 
+def Hip_VarlenCausalConvOp : Hip_DpsOp<"varlen_causal_conv"> {
+  let summary = "Packed FP16/FP32 causal convolution with unwindowed carry state";
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$input,
+    Hip_TensorOrMemRef:$weight,
+    Hip_TensorOrMemRef:$cumulative_lengths,
+    Hip_TensorOrMemRef:$bias,
+    Hip_TensorOrMemRef:$past_state,
+    Hip_TensorOrMemRef:$output,
+    Hip_TensorOrMemRef:$present_state
+  );
+}
+
+def Hip_GatedDeltaNetOp : Hip_DpsOp<"gated_delta_net"> {
+  let summary = "Packed FP16/FP32 Qwen gated delta recurrence with FP32 V-major state";
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$query,
+    Hip_TensorOrMemRef:$key,
+    Hip_TensorOrMemRef:$value,
+    Hip_TensorOrMemRef:$cumulative_lengths,
+    Hip_TensorOrMemRef:$decay,
+    Hip_TensorOrMemRef:$beta,
+    Hip_TensorOrMemRef:$past_state,
+    Hip_TensorOrMemRef:$a_log,
+    Hip_TensorOrMemRef:$dt_bias,
+    Hip_TensorOrMemRef:$output,
+    Hip_TensorOrMemRef:$present_state,
+    I64Attr:$key_heads,
+    I64Attr:$value_heads,
+    F32Attr:$scale
+  );
+}
+
+def Hip_GatedRmsNormOp : Hip_DpsOp<"gated_rms_norm"> {
+  let summary = "FP16/FP32 per-head RMS normalization with an FP32 SiLU gate";
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$input,
+    Hip_TensorOrMemRef:$weight,
+    Hip_TensorOrMemRef:$gate,
+    Hip_TensorOrMemRef:$output,
+    F32Attr:$epsilon
+  );
+}
+
+def Hip_MRotaryEmbeddingOp : Hip_DpsOp<"mrotary_embedding"> {
+  let summary = "Packed FP32 partial interleaved MRoPE for Qwen attention";
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$input,
+    Hip_TensorOrMemRef:$position_ids,
+    Hip_TensorOrMemRef:$cos_cache,
+    Hip_TensorOrMemRef:$sin_cache,
+    Hip_TensorOrMemRef:$output,
+    I64Attr:$num_heads
+  );
+}
+
+def Hip_PagedAttentionInt8Op : Hip_DpsOp<"paged_attention_int8",
+    [OpStateOpInterface]> {
+  let summary = "FP32 separate attention with static per-channel signed INT8 KV";
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$query,
+    Hip_TensorOrMemRef:$key,
+    Hip_TensorOrMemRef:$value,
+    Hip_TensorOrMemRef:$past_key,
+    Hip_TensorOrMemRef:$past_value,
+    Hip_TensorOrMemRef:$cumulative_lengths,
+    Hip_TensorOrMemRef:$past_lengths,
+    Hip_TensorOrMemRef:$block_table,
+    Hip_TensorOrMemRef:$key_scale,
+    Hip_TensorOrMemRef:$value_scale,
+    Hip_TensorOrMemRef:$output,
+    Hip_TensorOrMemRef:$present_key,
+    Hip_TensorOrMemRef:$present_value,
+    I64Attr:$num_heads,
+    I64Attr:$kv_num_heads,
+    F32Attr:$scale,
+    DefaultValuedAttr<I64Attr, "0">:$residual_bits
+  );
+  let extraClassDeclaration = [{
+    ::mlir::Value generateOpStateInit(::mlir::OpBuilder &builder,
+                                      ::mlir::Location loc,
+                                      ::mlir::Value statePtr, int32_t slot) {
+      return ::mlir::hip::emitOpStateConstruct(
+          builder, loc, statePtr, slot, "hipdnn_ep_op_state_construct_matmul", {});
+    }
+  }];
+}
+
+def Hip_PagedAttentionSeparateOp : Hip_DpsOp<"paged_attention_separate"> {
+  let summary = "FP16-cache head-256 attention with rotated FP16/FP32 separate Q/K/V";
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$query,
+    Hip_TensorOrMemRef:$key,
+    Hip_TensorOrMemRef:$value,
+    Hip_TensorOrMemRef:$past_key,
+    Hip_TensorOrMemRef:$past_value,
+    Hip_TensorOrMemRef:$cumulative_lengths,
+    Hip_TensorOrMemRef:$past_lengths,
+    Hip_TensorOrMemRef:$block_table,
+    Hip_TensorOrMemRef:$output,
+    Hip_TensorOrMemRef:$present_key,
+    Hip_TensorOrMemRef:$present_value,
+    I64Attr:$num_heads,
+    I64Attr:$kv_num_heads,
+    F32Attr:$scale
+  );
+}
+
 def Hip_PagedAttentionOp : Hip_DpsOp<"paged_attention"> {
   let summary = "FP16 packed paged attention with fused half-rotated RoPE";
   let arguments = (ins

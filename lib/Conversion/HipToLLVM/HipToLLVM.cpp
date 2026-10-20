@@ -257,6 +257,7 @@ void ConvertHipToLLVMPass::runOnOperation() {
   populateRopeLoweringPatterns(typeConverter, patterns);
   populateGqaLoweringPatterns(typeConverter, patterns);
   populatePagedAttentionLoweringPatterns(typeConverter, patterns);
+  populateQwenHybridLoweringPatterns(typeConverter, patterns);
   populateMultiHeadAttentionLoweringPatterns(typeConverter, patterns);
   populateMatMulNBitsLoweringPatterns(typeConverter, patterns);
   populateQMoELoweringPatterns(typeConverter, patterns);

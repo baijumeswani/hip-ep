@@ -97,11 +97,9 @@ inline constexpr SizeClassTable kSizeClassTable = BuildSizeClasses();
 inline constexpr const size_t *kSizeClasses = detail::kSizeClassTable.data;
 inline constexpr size_t kNumSizeClasses = detail::kSizeClassTable.count;
 
-// hipHostMalloc(Mapped|Coherent) backed OrtAllocator. One instance is created
-// per OrtMemoryInfo registered with OrtEpDevice (typically one DEFAULT GPU
-// info and one HOST_ACCESSIBLE info — both currently route to the same
-// mapped pinned allocator, since AMD APU iGPU shares physical memory with
-// the host). ORT keeps the allocator alive for the matching session.
+// DEFAULT allocations use hipMalloc; HOST_ACCESSIBLE allocations use mapped,
+// coherent hipHostMalloc. One instance owns each advertised OrtMemoryInfo and
+// frees its buffers with the matching driver API.
 struct HipGpuAllocator : OrtAllocator {
   // memory_info ownership stays with the factory. The OrtMemoryInfo's
   // device_id (extracted via OrtApi::MemoryInfoGetId at construction time)
@@ -110,7 +108,7 @@ struct HipGpuAllocator : OrtAllocator {
   // GPU that the OrtEpDevice actually represents (instead of always hitting
   // device 0).
   HipGpuAllocator(const OrtMemoryInfo *memory_info, const OrtApi &api);
-  // Frees every pinned buffer this allocator ever handed out (both the
+  // Frees every buffer this allocator ever handed out (both the
   // currently-free pool entries and any still checked out). Called by the
   // factory's ReleaseAllocator at session teardown.
   ~HipGpuAllocator();
@@ -130,10 +128,10 @@ private:
   bool ReplacesLiveBuffer(size_t size) const;
   bool ReplacedByLiveBuffer(size_t requested) const;
 
-  // Fixed size-class caching allocator. hipHostMalloc is a heavyweight
-  // (page-pinning) call: ORT re-allocates the per-Run input device-copy
+  // Fixed size-class caching allocator. Driver allocations are heavyweight:
+  // ORT re-allocates the per-Run input device-copy
   // buffers and (allocator mode) the graph-output buffers on EVERY inference,
-  // so without caching the EP pays dozens of hipHostMalloc + hipHostFree per
+  // so without caching the EP pays dozens of driver allocations/frees per
   // Compute (the dominant non-compute cost on small fixed-shape graphs).
   //
   // A request is rounded up to one of kSizeClasses and served from that
@@ -181,7 +179,7 @@ private:
   std::mutex pool_mutex_;
   // Index i holds reusable buffers each exactly kSizeClasses[i] bytes.
   std::array<std::vector<void *>, kNumSizeClasses> free_lists_;
-  // Every pointer hipHostMalloc'd by this allocator that is still outstanding
+  // Every driver allocation owned by this allocator that is still outstanding
   // -> its allocated byte size (the rounded-up class capacity for pooled
   // buffers, the exact size for large ones). Pooled buffers stay tracked for
   // the allocator's lifetime (Free only moves them onto a free list) so the
@@ -225,6 +223,7 @@ private:
   // (e.g. degenerate / fake OrtMemoryInfo); AllocImpl falls back to the
   // current HIP device in that case rather than failing the allocation.
   int device_id_;
+  bool host_accessible_;
 };
 
 // hipMemcpy / hipMemcpyAsync based OrtDataTransferImpl. A single shared

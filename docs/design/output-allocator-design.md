@@ -37,6 +37,21 @@ sess = ort.InferenceSession(model_path, sess_options=so)
 
 The compiler pipeline runs `hip-use-output-allocator` unconditionally, and `convert-hip-to-llvm` / `generate-interface` always emit the 2-arg ABI.
 
+### Device and host-accessible storage
+
+The HIP bridge's DEFAULT allocator uses `hipMalloc`. Its tensors are device
+pointers, not implicitly CPU-addressable cache or state buffers. The separate
+HOST_ACCESSIBLE allocator uses mapped, coherent `hipHostMalloc`. Copies and
+zeroing of DEFAULT storage must use the device/transfer interfaces, including
+on integrated GPUs; shared physical memory does not make arbitrary device
+virtual addresses safe to dereference on the host.
+
+Allocator pools remain separate for each memory descriptor. Reuse, trimming,
+allocation-failure retry and teardown preserve that descriptor and use the
+matching `hipFree` or `hipHostFree`. Capacity measurements must include device
+allocations and host-pinned allocations separately rather than treating a
+GPU-labelled mapped host pointer as VRAM residency.
+
 ---
 
 ## 2. Design
@@ -300,7 +315,7 @@ Note the `main_graph` / `main_graph_internal` split (from `convert-hip-to-llvm`)
 
 1. **The callback is `noexcept` across the C ABI.** `output_allocate_cb` is invoked from the model.dll's C runtime; a C++ exception unwinding through those frames is UB. The body is wrapped in `try/catch`, and any failure (out-of-range `out_idx`, an ORT throw, a scratch `hipMalloc` failure) ends in `LOG(FATAL)` — it never returns null, because the lowering builds a memref from the returned pointer and a null write would segfault with no diagnostic. This does **not** contradict the DLL-side `hipdnn_ep_alloc_output` forwarder returning null (above): the forwarder returns null only when *no* callback was installed — which never happens in a real session. Once the EP installs `output_allocate_cb`, the callback always returns a valid pointer.
 
-2. **Allocator returns a GPU device pointer** (Phase 3 contract). GPU outputs (EP `hipHostMalloc` allocator or OGA device memory: `memory_type == TENSOR_MEMORY_GPU`) zero-copy ORT's buffer. Host (CPU) outputs get an EP-owned GPU scratch pointer; the DLL writes there and the EP D2H-copies into ORT's host buffer after compute.
+2. **Allocator returns a GPU device pointer** (Phase 3 contract). GPU outputs (EP DEFAULT allocator or OGA device memory: `memory_type == TENSOR_MEMORY_GPU`) zero-copy ORT's buffer. Host (CPU) outputs get an EP-owned GPU scratch pointer; the DLL writes there and the EP D2H-copies into ORT's host buffer after compute.
 
 3. **Host-output D2H is EP-side and real-build-only.** The GPU scratch (one buffer per output index, grow-on-demand, reused across `Compute()`, freed in the dtor) and the `hipMemcpy` are under `#ifndef BUILD_MOCK_RUNTIME` (the EP only links `hip::host` in non-mock builds; mock writes host memory directly). The generated 2-arg `inference_compute` already ends in `hipdnn_ep_stream_sync`, so writes are complete on return and a plain **blocking** `hipMemcpy` D2H suffices — no extra stream sync.
 

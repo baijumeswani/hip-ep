@@ -12,6 +12,7 @@
 #include "morphizen/plugin.hpp"
 #include <fstream>
 #include <glog/logging.h>
+#include <set>
 #include <sstream>
 
 DEF_ENV_PARAM(MORPHIZEN_DEBUG_MLIR_BACKEND, "0")
@@ -20,6 +21,33 @@ DEF_ENV_PARAM(MORPHIZEN_DEBUG_MLIR_BACKEND, "0")
 namespace hipdnn::level1pass {
 
 namespace {
+
+class CompilationFileSystem : public morphizen::FileSystem {
+public:
+  explicit CompilationFileSystem(morphizen::FileSystem &base) : base_(base) {}
+
+  morphizen::FileReader *create_reader(const char *path) override {
+    return base_.create_reader(path);
+  }
+  morphizen::FileWriter *create_writer(const char *path) override {
+    auto *writer = base_.create_writer(path);
+    if (writer) {
+      dependencies.insert(path);
+    }
+    return writer;
+  }
+  void destroy_reader(morphizen::FileReader *reader) override {
+    base_.destroy_reader(reader);
+  }
+  void destroy_writer(morphizen::FileWriter *writer) override {
+    base_.destroy_writer(writer);
+  }
+
+  std::set<std::string> dependencies;
+
+private:
+  morphizen::FileSystem &base_;
+};
 
 // Error codes from hip-compiler plugin C API
 enum CompilerErrorCode {
@@ -120,9 +148,10 @@ MlirCompiler::compileFromBytecode(const std::string &mlir_bytecode,
   MY_LOG(2) << "About to call func with size = " << mlir_bytecode.size();
 
   CompilerError error = {};
+  CompilationFileSystem compilation_fs(*fs);
   auto result =
       func(mlir_bytecode.data(), mlir_bytecode.size(), temp_output_path.c_str(),
-           options_json.c_str(), &error, fs);
+           options_json.c_str(), &error, &compilation_fs);
 
   if (result != COMPILER_SUCCESS) {
     LOG(ERROR) << "Compilation failed: " << error.message;
@@ -158,6 +187,8 @@ MlirCompiler::compileFromBytecode(const std::string &mlir_bytecode,
   artifact.filename = "model_compiled";
   artifact.bytes = std::move(buffer);
   artifact.format = config.artifactFormat;
+  artifact.dependencyFilenames.assign(compilation_fs.dependencies.begin(),
+                                      compilation_fs.dependencies.end());
 
   LOG(INFO) << "Artifact created: " << artifact.bytes.size() << " bytes";
 

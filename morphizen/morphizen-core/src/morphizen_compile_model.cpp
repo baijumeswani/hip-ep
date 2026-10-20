@@ -9,6 +9,7 @@
 #include <glog/logging.h>
 
 #include "md5.h"
+#include "sha256.h"
 #include "./config.hpp"
 #include "./file_lock.hpp"
 #include "./logger_adapter.hpp"
@@ -26,6 +27,7 @@
 #include <limits>
 #include <locale>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <stdio.h>
 #include <stdlib.h>
@@ -157,6 +159,135 @@ bool check_cache_hit(PassContextImp &context) {
   return false;
 }
 
+static std::string
+source_model_fingerprint(const std::filesystem::path &model_path,
+                         const Graph &graph) {
+  if (*MORPHIZEN_ORT_API(get_lib_name)() != "morphizen-mlir-imp") {
+    throw ArtifactCompatibilityError(
+        "Reusable HIP artifacts require the MLIR identity backend.");
+  }
+  // The initializer wrapper enumerates only this graph's constants. Refuse
+  // reusable control-flow artifacts until nested weight identities are exposed.
+  for (const auto &node : morphizen_cxx::GraphConstRef(graph).nodes()) {
+    if (MORPHIZEN_ORT_API_EXT(node_has_subgraphs)(node)) {
+      throw ArtifactCompatibilityError("Reusable HIP artifacts do not support "
+                                       "nested graph weight identity.");
+    }
+    for (const auto *attribute : morphizen::node_get_attributes(node)) {
+      const auto type = MORPHIZEN_ORT_API(attr_proto_get_type)(*attribute);
+      if (type == 4 || type == 9) { // ONNX TENSOR / TENSORS
+        throw ArtifactCompatibilityError(
+            "Reusable HIP artifacts do not support tensor-attribute weight "
+            "identity; use graph initializers.");
+      }
+    }
+  }
+  if (model_path.empty()) {
+    throw ArtifactCompatibilityError(
+        "Reusable HIP artifacts require a file-backed source ONNX model; "
+        "in-memory graphs cannot establish the source model identity.");
+  }
+  std::ifstream model(model_path, std::ios::binary);
+  if (!model) {
+    throw ArtifactCompatibilityError("Cannot read source model for artifact "
+                                     "identity: " +
+                                     model_path.string());
+  }
+  SHA256 hash;
+  char buffer[65536];
+  while (model.read(buffer, sizeof(buffer)) || model.gcount() != 0) {
+    hash.add(buffer, static_cast<size_t>(model.gcount()));
+  }
+  if (!model.eof()) {
+    throw ArtifactCompatibilityError("Failed reading source model for artifact "
+                                     "identity: " +
+                                     model_path.string());
+  }
+  // Free-dimension overrides specialize the live graph without changing either
+  // the source protobuf or the session configuration key/value entries.
+  const auto graph_ref = morphizen_cxx::GraphConstRef(graph);
+  const auto hash_interface = [&](const char *kind, const auto &arguments) {
+    for (const auto &argument : arguments) {
+      std::string contract = std::string("\n") + kind + ":" +
+                             std::to_string(argument.element_type()) + ":";
+      const auto shape = argument.shape();
+      if (!shape || argument.is_unknown_shape()) {
+        contract += "unknown";
+      } else {
+        contract += std::to_string(shape->size()) + ":";
+        for (const auto dimension : *shape)
+          contract += std::to_string(dimension) + ",";
+      }
+      contract += "\n";
+      hash.add(contract.data(), contract.size());
+    }
+  };
+  hash_interface("input", graph_ref.inputs());
+  hash_interface("output", graph_ref.outputs());
+  // Hash initializer contents, not external-data paths or timestamps. The
+  // source protobuf already covers topology, attributes, dtypes and shapes.
+  std::map<std::string, morphizen_cxx::NodeArgConstRef> initializers;
+  for (const auto &initializer :
+       morphizen_cxx::GraphConstRef(graph).constant_initializers()) {
+    initializers.emplace(initializer.name(), initializer);
+  }
+  for (const auto &[name, initializer] : initializers) {
+    std::string location;
+    size_t offset = 0, size = 0, checksum = 0;
+    const int external = MORPHIZEN_ORT_API(node_arg_external_location)(
+        graph, initializer, location, offset, size, checksum);
+    if (external) {
+      const std::string header =
+          "\n" + name + ":" + std::to_string(size) + "\n";
+      hash.add(header.data(), header.size());
+      // The bridge borrows these initializer bytes from the live ORT graph.
+      if (location == "*/_ORT_MEM_ADDR_/*") {
+        if (offset == 0 && size != 0) {
+          throw ArtifactCompatibilityError(
+              "Missing in-memory initializer for artifact identity: " + name);
+        }
+        hash.add(reinterpret_cast<const void *>(offset), size);
+        continue;
+      }
+      auto path = std::filesystem::path(location);
+      if (path.is_relative()) {
+        path = model_path.parent_path() / path;
+      }
+      if (location.empty() ||
+          offset >
+              static_cast<size_t>(std::numeric_limits<std::streamoff>::max())) {
+        throw ArtifactCompatibilityError(
+            "Invalid external initializer range for artifact identity: " +
+            name);
+      }
+      std::ifstream weights(path, std::ios::binary);
+      if (!weights || !weights.seekg(static_cast<std::streamoff>(offset))) {
+        throw ArtifactCompatibilityError(
+            "Cannot read external initializer for artifact identity: " +
+            path.string());
+      }
+      size_t remaining = size;
+      while (remaining != 0) {
+        const auto count =
+            static_cast<std::streamsize>(std::min(remaining, sizeof(buffer)));
+        if (!weights.read(buffer, count)) {
+          throw ArtifactCompatibilityError(
+              "Truncated external initializer for artifact identity: " + name);
+        }
+        hash.add(buffer, static_cast<size_t>(count));
+        remaining -= static_cast<size_t>(count);
+      }
+      continue;
+    }
+    const auto data = initializer.const_data_as_raw();
+    const std::string header =
+        "\n" + name + ":" + std::to_string(data.size()) + "\n";
+    hash.add(header.data(), header.size());
+    hash.add(data.data(), data.size());
+  }
+  return hash.getHash();
+}
+
 static int64_t compute_model_clone_threshold(const ConfigProto &config_proto,
                                              PassContext *context) {
   // Check provider option first (user override)
@@ -180,6 +311,9 @@ static int64_t compute_model_clone_threshold(const ConfigProto &config_proto,
 
 void compile_onnx_model_2(std::shared_ptr<PassContextImp> context,
                           const Graph &onnx_graph) {
+  const auto requested_source = context->context_proto.source_model_sha256();
+  const auto requested_session =
+      context->context_proto.compilation_session_sha256();
   bool cache_hit = check_cache_hit(*context);
   if (!cache_hit) {
     auto &model = morphizen_cxx::GraphConstRef(onnx_graph).model();
@@ -193,6 +327,18 @@ void compile_onnx_model_2(std::shared_ptr<PassContextImp> context,
   }
   auto encryption_key = context->get_provider_option("encryption_key", "");
   read_cache(context);
+  if (cache_hit &&
+      (requested_source.empty() ||
+       context->context_proto.source_model_sha256() != requested_source)) {
+    throw ArtifactCompatibilityError(
+        "Prebuilt HIP artifact source model/weight identity mismatch; "
+        "recompile the artifact from the requested ONNX model.");
+  }
+  if (cache_hit && context->context_proto.compilation_session_sha256() !=
+                       requested_session) {
+    throw ArtifactCompatibilityError(
+        "Prebuilt HIP artifact session options mismatch; recompile it.");
+  }
 }
 
 static std::string get_dump_md5_file(const std::string &suffix) {
@@ -355,6 +501,25 @@ std::shared_ptr<PassContextImp> initialize_context(
   // Algorithm-A first, if that fails then use Algorithm-B to identify the
   // model/target
   context->target_auto_discovery(model);
+
+  SHA256 session_hash;
+  for (const auto &[key, value] : session_configs) {
+    // Export paths/modes differ when the same compilation is restored.
+    if (key.compare(0, 11, "ep.context_") == 0) {
+      continue;
+    }
+    const std::string entry = std::to_string(key.size()) + ":" + key +
+                              std::to_string(value.size()) + ":" + value;
+    session_hash.add(entry.data(), entry.size());
+  }
+  context->context_proto.set_compilation_session_sha256(session_hash.getHash());
+
+  if (!context->is_ep_context_model &&
+      (context->get_provider_option("prebuild_cache_context").has_value() ||
+       context->get_session_config("ep.context_enable", "0") == "1")) {
+    context->context_proto.set_source_model_sha256(
+        source_model_fingerprint(context->model_path, onnx_graph));
+  }
 
   // log version of binary
   context->print_version_info("EXEC VERSION: ");
@@ -917,7 +1082,20 @@ restore_execution_providers_from_ep_context_model(
     abort();
   }
 
+  const auto requested_session =
+      context->context_proto.compilation_session_sha256();
   context->update_pass_context_from_context_json_in_cache();
+  if (context->context_proto.source_model_sha256().size() != 64) {
+    throw ArtifactCompatibilityError(
+        "EPContext has no supported HIP source model/weight identity; "
+        "regenerate it with the current compiler.");
+  }
+  if (context->context_proto.compilation_session_sha256() !=
+      requested_session) {
+    throw ArtifactCompatibilityError(
+        "EPContext session options do not match the compilation; "
+        "regenerate it with the requested session options.");
+  }
   return create_execution_providers_from_ep_context_nodes(context,
                                                           ep_context_nodes);
 }
@@ -1045,9 +1223,18 @@ std::vector<std::unique_ptr<ExecutionProvider>> compile_onnx_model_3_internal(
   static std::mutex mtx;
   std::lock_guard<std::mutex> t_lock(mtx);
   auto ep_context_nodes = get_ep_context_nodes(onnx_graph);
-  auto context =
-      initialize_context(model_path, onnx_graph, ep_context_nodes, options,
-                         session_configs, std::move(logger_adapter));
+  std::shared_ptr<PassContextImp> context;
+  try {
+    context =
+        initialize_context(model_path, onnx_graph, ep_context_nodes, options,
+                           session_configs, std::move(logger_adapter));
+  } catch (const ArtifactCompatibilityError &e) {
+    LOG(ERROR) << "HIP artifact compatibility failure: " << e.what();
+    if (set_ort_status) {
+      set_ort_status(1, e.what());
+    }
+    return {};
+  }
   auto measture_compile_onnx_model_3 = context->measure("compile_onnx_model_3");
   // Cache is always in memory (tar_file_), no file lock needed
   auto p_cpu_usage = CreateICPUUsage();
@@ -1085,7 +1272,13 @@ std::vector<std::unique_ptr<ExecutionProvider>> compile_onnx_model_3_internal(
     }
   }
 #endif
-  catch (const morphizen_encryption::EncryptionError &e) {
+  catch (const ArtifactCompatibilityError &e) {
+    LOG(ERROR) << "HIP artifact compatibility failure: " << e.what();
+    if (set_ort_status) {
+      set_ort_status(1, e.what());
+    }
+    return {};
+  } catch (const morphizen_encryption::EncryptionError &e) {
     if (set_ort_status) {
       set_ort_status(1, e.what());
     }

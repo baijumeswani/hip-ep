@@ -3,6 +3,7 @@
  * Licensed under the MIT License.
  */
 #include "../debug_log.h"
+#include "../execution_status.h"
 #include "../hipdnn_ep_runtime.h"
 #include "../op_profile.h"
 #include "../op_state.h"
@@ -16,10 +17,13 @@
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt-ext.hpp>
 
+#include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -327,19 +331,21 @@ uint64_t prefill_shape_key(int64_t M, int64_t N, int64_t K) {
          (static_cast<uint64_t>(K) & 0x3FFFFF);
 }
 
-// Y[M,N] (row-major, fp16) = A[M,K] @ Bfp16[N,K]^T + (bias[N]).
+// Y[M,N] (row-major, fp16/fp32) = A[M,K] @ weights[N,K]^T + (bias[N]).
 //
 // hipBLASLt is column-major, so we compute D = Y^T = [N,M] col-major:
 // clang-format off
-//   matA = Bfp16 : row-major [N,K] == col-major [K,N] ld=K, TRANSA=OP_T -> [N,K]
+//   matA = weights : row-major [N,K] == col-major [K,N] ld=K, TRANSA=OP_T -> [N,K]
 //   matB = A     : row-major [M,K] == col-major [K,M] ld=K, TRANSB=OP_N -> [K,M]
-//   D           : col-major [N,M] ld=N == row-major Y[M,N]
+//   D           : col-major [N,M] ld=output_ld == strided row-major Y[M,N]
 // clang-format on
 // A per-output-channel bias[N] is the per-row vector of D -> BIAS epilogue.
-int matmul_nbits_prefill_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
-                                   const void *A, const void *Bfp16,
-                                   const void *bias, void *Y, int64_t M,
-                                   int64_t N, int64_t K) {
+int matmul_nbits_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
+                           const void *A, const void *weights, const void *bias,
+                           void *Y, int64_t M, int64_t N, int64_t K,
+                           int64_t element_size = 2, int64_t output_ld = 0) {
+  if (output_ld == 0)
+    output_ld = N;
   hipblasLtHandle_t handle =
       static_cast<hipblasLtHandle_t>(hipdnn_ep_state_get_hipblas_handle(state));
   hipStream_t stream =
@@ -355,7 +361,7 @@ int matmul_nbits_prefill_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
   hipblasLtMatmulDesc_t desc = nullptr;
   hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
   hipblasLtEpilogue_t epi = HIPBLASLT_EPILOGUE_BIAS;
-  hipDataType bias_dtype = HIP_R_16F;
+  hipDataType bias_dtype = element_size == 4 ? HIP_R_32F : HIP_R_16F;
   float alpha = 1.0f, beta = 0.0f;
   void *ws = nullptr;
   size_t ws_size = 0;
@@ -364,9 +370,10 @@ int matmul_nbits_prefill_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
   bool have_algo = false;
   int result = 0;
 
-  HIPBLAS_CHECK(hipblasLtMatrixLayoutCreate(&matA, HIP_R_16F, K, N, K));
-  HIPBLAS_CHECK(hipblasLtMatrixLayoutCreate(&matB, HIP_R_16F, K, M, K));
-  HIPBLAS_CHECK(hipblasLtMatrixLayoutCreate(&matD, HIP_R_16F, N, M, N));
+  HIPBLAS_CHECK(hipblasLtMatrixLayoutCreate(&matA, bias_dtype, K, N, K));
+  HIPBLAS_CHECK(hipblasLtMatrixLayoutCreate(&matB, bias_dtype, K, M, K));
+  HIPBLAS_CHECK(
+      hipblasLtMatrixLayoutCreate(&matD, bias_dtype, N, M, output_ld));
   HIPBLAS_CHECK(
       hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
   HIPBLAS_CHECK(hipblasLtMatmulDescSetAttribute(
@@ -423,8 +430,8 @@ int matmul_nbits_prefill_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
         std::vector<hipblasLtMatmulHeuristicResult_t> all;
         if (hipblaslt_ext::getAllAlgos(
                 handle, hipblaslt_ext::GemmType::HIPBLASLT_GEMM, opT, opN,
-                HIP_R_16F, HIP_R_16F, HIP_R_16F, HIP_R_16F, HIPBLAS_COMPUTE_32F,
-                all) == HIPBLAS_STATUS_SUCCESS) {
+                bias_dtype, bias_dtype, bias_dtype, bias_dtype,
+                HIPBLAS_COMPUTE_32F, all) == HIPBLAS_STATUS_SUCCESS) {
           for (auto &r : all) {
             if (static_cast<int>(cands.size()) >= candidate_limit)
               break;
@@ -463,8 +470,8 @@ int matmul_nbits_prefill_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
           bench_ws_size = hipdnn_ep_state_get_workspace_size(state);
         }
         void *bench_out = nullptr;
-        size_t bench_bytes =
-            static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(__fp16);
+        size_t bench_bytes = static_cast<size_t>(M) *
+                             static_cast<size_t>(output_ld) * element_size;
         hipEvent_t bs = nullptr, be = nullptr;
         double best_ms = 1e30;
         if (bench_bytes > 0 &&
@@ -479,9 +486,9 @@ int matmul_nbits_prefill_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
             void *wsp = (wss > 0) ? bench_ws : nullptr;
             hipblasLtMatmulAlgo_t *ap = (i < 0) ? nullptr : &cands[i].algo;
             auto run = [&]() {
-              return hipblasLtMatmul(handle, desc, &alpha, Bfp16, matA, A, matB,
-                                     &beta, bench_out, matD, bench_out, matD,
-                                     ap, wsp, wss, stream);
+              return hipblasLtMatmul(handle, desc, &alpha, weights, matA, A,
+                                     matB, &beta, bench_out, matD, bench_out,
+                                     matD, ap, wsp, wss, stream);
             };
             if (run() != HIPBLAS_STATUS_SUCCESS)
               continue;
@@ -532,7 +539,7 @@ int matmul_nbits_prefill_hipblaslt(MatmulNbitsState *mst, RuntimeState *state,
   }
 
   HIPBLAS_CHECK(hipblasLtMatmul(
-      handle, desc, &alpha, Bfp16, matA, A, matB, &beta, Y, matD, Y, matD,
+      handle, desc, &alpha, weights, matA, A, matB, &beta, Y, matD, Y, matD,
       have_algo ? &chosen.algo : nullptr, ws, ws_size, stream));
 
 cleanup:
@@ -556,6 +563,7 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
                       int64_t K, int64_t batch_count, int64_t bits,
                       int64_t block_size, int64_t elem_size,
                       int64_t zp_elem_size, int64_t scale_elem_size) {
+  ExecutionStatusGuard execution_status(state);
   OP_PROFILE(
       "matmul_nbits",
       [&] {
@@ -588,6 +596,55 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
   if (g_idx) {
     fprintf(stderr, "wrap_matmul_nbits: g_idx not supported\n");
     return -1;
+  }
+
+  if (elem_size == 4 && bits == 4 && block_size == 32 && !zero_points) {
+    if (M <= 0 || N <= 0 || N > INT_MAX || K <= 0 || K > INT_MAX ||
+        batch_count <= 0 || M > INT_MAX / batch_count ||
+        (scale_elem_size != 2 && scale_elem_size != 4) ||
+        static_cast<uint64_t>(M * batch_count) >
+            std::numeric_limits<size_t>::max() / sizeof(float) /
+                static_cast<uint64_t>(std::max(N, K))) {
+      fprintf(stderr, "matmul_nbits: invalid W4A32 geometry or scales\n");
+      return -1;
+    }
+    auto *mst = MatmulNbitsState::get_op_state(state, op_state_slot);
+    if (!mst) {
+      fprintf(stderr, "matmul_nbits: no state for W4A32 slot %d\n",
+              op_state_slot);
+      return -1;
+    }
+    constexpr int64_t tile_channels = 256;
+    const auto channels = std::min(N, tile_channels);
+    auto *scratch =
+        static_cast<float *>(hipdnn_ep_state_ensure_matmul_nbits_scratch(
+            state, stream, static_cast<size_t>(channels) * K * sizeof(float)));
+    if (!scratch)
+      return -1;
+    const int64_t groups = (K + 31) / 32;
+    for (int64_t start = 0; start < N; start += tile_channels) {
+      const int64_t count = std::min(tile_channels, N - start);
+      const int status = hip_matmul_nbits_dequant_b_fp32(
+          stream, static_cast<const uint8_t *>(B) + start * groups * 16,
+          static_cast<const uint8_t *>(scales) +
+              start * groups * scale_elem_size,
+          scratch, static_cast<int>(count), static_cast<int>(K),
+          static_cast<int>(scale_elem_size));
+      if (status != 0) {
+        fprintf(stderr, "matmul_nbits: W4A32 dequantization failed: %d\n",
+                status);
+        return status;
+      }
+      const auto *tile_bias =
+          bias ? static_cast<const float *>(bias) + start : nullptr;
+      const int result =
+          matmul_nbits_hipblaslt(mst, state, A, scratch, tile_bias,
+                                 static_cast<float *>(output) + start,
+                                 M * batch_count, count, K, sizeof(float), N);
+      if (result != 0)
+        return result;
+    }
+    return execution_status.Finish(0);
   }
 
   // ONNX MatMulNBits allows `scales` to be fp16 or fp32 independent of the
@@ -766,8 +823,8 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
           static_cast<int>(K), static_cast<int>(block_size));
       if (!b_fp16)
         return -1;
-      result = matmul_nbits_prefill_hipblaslt(mst, state, A, b_fp16, bias,
-                                              output, M, N, K);
+      result =
+          matmul_nbits_hipblaslt(mst, state, A, b_fp16, bias, output, M, N, K);
       goto cleanup;
     }
     // Unsupported zero-point layouts use the general kernel dispatch below.
@@ -825,5 +882,5 @@ int wrap_matmul_nbits(RuntimeState *state, int op_state_slot, const void *A,
                              zp_elem_size, pre_zp_u8, pre_zp_fp16));
 
 cleanup:
-  return result;
+  return execution_status.Finish(result);
 }

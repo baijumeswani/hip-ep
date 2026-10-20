@@ -197,6 +197,8 @@ static int initialize_state_handles(RuntimeState **out_state) {
   state->workspace_size = 0;
   state->matmul_nbits_fp16_scratch = nullptr;
   state->matmul_nbits_fp16_scratch_size = 0;
+  state->paged_attention_scratch = nullptr;
+  state->paged_attention_scratch_size = 0;
   state->host_scratch_base = nullptr;
   state->host_scratch_size = 0;
   // Start with no output allocator (null context + callback). The EP installs
@@ -749,6 +751,9 @@ int hipdnn_ep_state_cleanup(RuntimeState *state) {
   }
   if (state->matmul_nbits_fp16_scratch) {
     HIP_CLEANUP(hipFree(state->matmul_nbits_fp16_scratch));
+  }
+  if (state->paged_attention_scratch) {
+    HIP_CLEANUP(hipFree(state->paged_attention_scratch));
   }
 
   // Free qmoe device scratch + pinned host mirror (if allocated)

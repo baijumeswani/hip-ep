@@ -8,14 +8,22 @@ This reference summarizes ONNX operations handled by the built-in ONNX-to-HIP pi
 
 The conversion registrations in `lib/Conversion/OnnxToHip/OnnxToHip.cpp` and the corresponding LIT/numeric tests are the source of truth. Individual operations may have data-type, rank, attribute, or dynamic-shape restrictions that are documented in their conversion and test files.
 
-### FP16 paged attention qualification
+### Paged attention qualification
 
 `com.microsoft::PagedAttention` currently accepts packed FP16 QKV, head size 64,
 grouped query heads, full causal attention, and fused non-interleaved RoPE with
 FP16 cosine/sine tables. Its int32 cumulative lengths, past lengths and block
-table are device-resident. Sequence length is limited to 4,096 tokens; page size
-must be a power of two from 16 through 4,096. Separate Q/K/V, local windows, sinks,
-QK normalization inputs, softcap, and quantized/rotated KV are rejected rather
+table are device-resident. FP16-cache sequence length is limited to 4,096 tokens; page size
+must be a power of two from 16 through 4,096. A second route accepts separate
+packed FP16 or FP32 Q/K/V with head size 256 and pre-applied RoPE; cosine/sine inputs
+must then be absent. Both routes accept an optional `int32[3]` attention
+metadata hint, while validating the authoritative device sequence/page metadata.
+The separate-input route also accepts signed INT8 caches with positive finite
+FP32 per-channel scales. Optional residual8 stores a signed INT8 correction plane
+after the high plane, doubling the last cache dimension; readers reconstruct
+`scale * (high + (residual + 128) / 256)`. FP32 activations are not narrowed before
+attention. The INT8-cache context ceiling is 262,144 tokens. Local windows, sinks,
+QK normalization inputs, softcap, and rotated KV are rejected rather
 than silently approximated.
 
 The caller must bind each present cache to the corresponding past allocation.
@@ -38,6 +46,30 @@ destructive GPU fault.
 in FP32, rounding only when storing FP16 outputs. Requesting the optional residual
 output does not change the normalized output; scalar and packed paths are tested
 with and without bias against the ORT CPU implementation.
+
+### Experimental Qwen hybrid target operators
+
+The target-only hybrid path additionally implements these narrow contracts:
+
+| Operation (`com.microsoft`) | Contract |
+|---|---|
+| VarlenCausalConvWithState | Matching FP16 or FP32 `[tokens, channels]`, kernel-4 depthwise weights, bias, SiLU, int32 cumulative lengths, and same-type `[batch, channels, 3]` carry. |
+| GatedDeltaNet | Matching FP16 or FP32 Q/K/V, head size 128, value-head count divisible by key-head count, Qwen decay and sigmoid beta, FP32 V-major `[batch, value_heads, 128, 128]` recurrent state. Q/K L2 normalization uses the ORT operator's `1e-12` epsilon. |
+| GatedRMSNorm | Matching FP16 or FP32 input/gate with a statically known common width, 128-element groups, FP32 variance/SiLU gating arithmetic, and a positive finite epsilon. Sigmoid gating is unsupported. |
+| MRotaryEmbedding | Packed FP32 `[1, tokens, heads * 256]`, int64 `[3, 1, tokens]` positions, partial rotary width 64, unit scale, layout 1, sections `[11, 11, 10]`, and FP32 caches of statically known width 32. Remaining head dimensions pass through unchanged. |
+
+Convolution and recurrence validate packed lengths before any output/state
+write; MRoPE validates every position before writing. Dynamic output extents are
+checked against the inputs. Convolution and recurrent present state may alias
+past state, although the transactional Engine uses separate staged output banks.
+These kernels retain only per-channel convolution carry and per-wave recurrent
+rows, not a quadratic token workspace. Unsupported BF16 or transition-capture
+forms are rejected rather than reinterpreted as FP16.
+
+Compiled numerical/failure-path operator tests and real fixed-state
+rollback/cancellation checks do not qualify end-to-end model accuracy. Full
+hybrid model accuracy remains unqualified until independent long-prompt
+matching-weight logit checks pass.
 
 ## Runtime-backed operations
 
@@ -128,7 +160,7 @@ with and without bias against the ORT CPU implementation.
 | RotaryEmbedding (`com.microsoft`) | Custom HIP kernel |
 | RotaryEmbedding (`ai.onnx`) | Custom HIP kernel |
 | GroupQueryAttention (`com.microsoft`) | Custom HIP kernels and hipBLASLt |
-| PagedAttention (`com.microsoft`) | FP16 packed rank-2 QKV, head size 64, grouped heads, causal attention and non-interleaved fused RoPE. FP16 `[blocks, page_size, kv_heads, 64]` caches must be caller-bound as identical past/present GPU buffers. Int32 cumulative lengths, past lengths and block table reside on device; rotary tables are FP16. Context is limited to 4096 tokens, with power-of-two page sizes 16–4096. Metadata is validated before any cache write. Separate Q/K/V, QK norm, sinks, windows and quantized/rotated caches are rejected. |
+| PagedAttention (`com.microsoft`) | FP16 packed rank-2 QKV with head size 64 and fused non-interleaved RoPE, or matching FP16/FP32 separate Q/K/V with head size 256 and pre-applied RoPE. FP16 or signed INT8 per-channel caches (optionally residual8) must be caller-bound as identical past/present GPU buffers. Int32 cumulative lengths, past lengths and block table reside on device. Context is limited to 4096 tokens for FP16 caches or 262144 for INT8 caches, with power-of-two page sizes 16–4096. Metadata is validated before any cache write. QK norm inputs, sinks, windows and rotated caches are rejected. |
 | MultiHeadAttention (`com.microsoft`) | Lowered to GroupQueryAttention or decomposed hipBLASLt/custom-kernel paths |
 | Attention (`com.microsoft`) | Fused QKV split into GroupQueryAttention. Equal Q/K/V sizes may be inferred from a `[H, 3H]` weight. Bidirectional and causal, with static or dynamic batch and sequence. A rank-1 length or rank-2 padding mask becomes an additive attention bias. |
 | Attention (`ai.onnx`, opset 23/24) | Lowered to GroupQueryAttention for supported rank-3/rank-4, causal/masked, output, and KV-cache forms |
@@ -145,6 +177,10 @@ with and without bias against the ORT CPU implementation.
 | QLinearMatMul | Custom HIP kernel. Rank-2 8-bit, per-tensor f32 scales and zero points. Separate from the `hip.qmatmul` QDQ fusion |
 | LinearAttention (`com.microsoft`) | Custom HIP kernel |
 | CausalConvWithState (`com.microsoft`) | Custom HIP kernel |
+| VarlenCausalConvWithState (`com.microsoft`) | Matching FP16/FP32 kernel-4 SiLU convolution with three-element carry; see hybrid target contracts above. |
+| GatedDeltaNet (`com.microsoft`) | Matching FP16/FP32 Qwen gated-delta with FP32 V-major recurrent state; no transition capture. |
+| GatedRMSNorm (`com.microsoft`) | Matching FP16/FP32 grouped width-128 SiLU-gated RMS normalization. |
+| MRotaryEmbedding (`com.microsoft`) | Packed FP32 head-256 partial rotary embedding, layout 1 and sections `[11,11,10]`. |
 | Relu | Decomposed to Max |
 | LeakyRelu | Custom HIP kernel |
 | PRelu | Custom HIP kernel. Slope broadcasts onto X; f16/bf16/f32/f64 |

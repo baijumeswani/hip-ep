@@ -8,6 +8,106 @@
 namespace mlir::hip {
 namespace {
 
+struct PagedAttentionInt8Lowering
+    : ConvertOpToLLVMPattern<PagedAttentionInt8Op> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(PagedAttentionInt8Op op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    const auto loc = op.getLoc();
+    SmallVector<Type> signature{getPtrType(), rewriter.getI32Type()};
+    signature.append(13, getPtrType());
+    SmallVector<Value> arguments{adaptor.getCtx(),
+                                 getOpStateSlotValue(op, rewriter, loc)};
+    for (Value operand : adaptor.getOperands().drop_front())
+      arguments.push_back(extractContiguousMemRefPtr(operand, rewriter, loc));
+    const auto dimension = [&](unsigned operand, unsigned index) {
+      signature.push_back(rewriter.getI64Type());
+      arguments.push_back(getMemRefDimSize(
+          cast<MemRefType>(op->getOperand(operand).getType()), index,
+          adaptor.getOperands()[operand], rewriter, loc));
+    };
+    for (unsigned operand : {1u, 2u, 3u, 11u, 7u, 6u, 8u})
+      dimension(operand, 0);
+    dimension(8, 1);
+    for (unsigned operand : {4u, 5u, 12u, 13u}) {
+      dimension(operand, 0);
+      dimension(operand, 1);
+    }
+    for (int64_t value : {op.getNumHeads(), op.getKvNumHeads()}) {
+      signature.push_back(rewriter.getI64Type());
+      arguments.push_back(
+          LLVM::ConstantOp::create(rewriter, loc, rewriter.getI64Type(),
+                                   rewriter.getI64IntegerAttr(value)));
+    }
+    signature.push_back(rewriter.getF32Type());
+    arguments.push_back(LLVM::ConstantOp::create(
+        rewriter, loc, rewriter.getF32Type(), op.getScaleAttr()));
+    signature.push_back(rewriter.getI64Type());
+    arguments.push_back(LLVM::ConstantOp::create(
+        rewriter, loc, rewriter.getI64Type(), op.getResidualBitsAttr()));
+    auto function = LLVM::lookupOrCreateFn(
+        rewriter, op->getParentOfType<ModuleOp>(), "wrap_paged_attention_int8",
+        signature, rewriter.getI32Type());
+    if (failed(function))
+      return failure();
+    LLVM::CallOp::create(rewriter, loc, *function, arguments);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct PagedAttentionSeparateLowering
+    : ConvertOpToLLVMPattern<PagedAttentionSeparateOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(PagedAttentionSeparateOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    const auto loc = op.getLoc();
+    SmallVector<Type> signature(12, getPtrType());
+    SmallVector<Value> arguments{adaptor.getCtx()};
+    for (Value operand : adaptor.getOperands().drop_front())
+      arguments.push_back(extractContiguousMemRefPtr(operand, rewriter, loc));
+    const auto dimension = [&](unsigned operand, unsigned index) {
+      signature.push_back(rewriter.getI64Type());
+      arguments.push_back(getMemRefDimSize(
+          cast<MemRefType>(op->getOperand(operand).getType()), index,
+          adaptor.getOperands()[operand], rewriter, loc));
+    };
+    for (unsigned operand : {1u, 2u, 3u, 9u, 7u, 6u, 8u})
+      dimension(operand, 0);
+    dimension(8, 1);
+    for (unsigned operand : {4u, 5u, 10u, 11u}) {
+      dimension(operand, 0);
+      dimension(operand, 1);
+    }
+    for (int64_t value : {op.getNumHeads(), op.getKvNumHeads()}) {
+      signature.push_back(rewriter.getI64Type());
+      arguments.push_back(
+          LLVM::ConstantOp::create(rewriter, loc, rewriter.getI64Type(),
+                                   rewriter.getI64IntegerAttr(value)));
+    }
+    signature.push_back(rewriter.getF32Type());
+    arguments.push_back(LLVM::ConstantOp::create(
+        rewriter, loc, rewriter.getF32Type(), op.getScaleAttr()));
+    signature.push_back(rewriter.getI64Type());
+    arguments.push_back(LLVM::ConstantOp::create(
+        rewriter, loc, rewriter.getI64Type(),
+        rewriter.getI64IntegerAttr(getHipdnnDataType(
+            cast<MemRefType>(op.getQuery().getType()).getElementType()))));
+    auto function = LLVM::lookupOrCreateFn(
+        rewriter, op->getParentOfType<ModuleOp>(),
+        "wrap_paged_attention_separate", signature, rewriter.getI32Type());
+    if (failed(function))
+      return failure();
+    LLVM::CallOp::create(rewriter, loc, *function, arguments);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct PagedAttentionLowering : ConvertOpToLLVMPattern<PagedAttentionOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -66,7 +166,8 @@ struct PagedAttentionLowering : ConvertOpToLLVMPattern<PagedAttentionOp> {
 
 void populatePagedAttentionLoweringPatterns(const LLVMTypeConverter &converter,
                                             RewritePatternSet &patterns) {
-  patterns.add<PagedAttentionLowering>(converter);
+  patterns.add<PagedAttentionLowering, PagedAttentionSeparateLowering,
+               PagedAttentionInt8Lowering>(converter);
 }
 
 } // namespace mlir::hip

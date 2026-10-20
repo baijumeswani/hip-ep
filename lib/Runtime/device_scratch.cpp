@@ -91,6 +91,41 @@ int hipdnn_ep_state_ensure_workspace(RuntimeState *state, size_t needed_size) {
 }
 
 #if defined(HIPDNN_EP_REAL_RUNTIME)
+void *hipdnn_ep_state_ensure_paged_attention_scratch(RuntimeState *state,
+                                                     size_t bytes) {
+  if (!state || bytes == 0 || bytes > 256 * 1024 * 1024) {
+    fprintf(stderr, "paged_attention: invalid or excessive scratch size\n");
+    if (state)
+      state->host_error_flag = -1;
+    return nullptr;
+  }
+  if (grow_device_buffer(state->stream, state->paged_attention_scratch,
+                         state->paged_attention_scratch_size, bytes,
+                         "paged_attention scratch") != 0) {
+    state->host_error_flag = -1;
+    return nullptr;
+  }
+  return state->paged_attention_scratch;
+}
+
+void *hipdnn_ep_state_ensure_matmul_nbits_scratch(RuntimeState *state,
+                                                  void *stream, size_t bytes) {
+  if (!state || !stream || bytes == 0) {
+    fprintf(stderr, "matmul_nbits: invalid weight scratch arguments\n");
+    if (state)
+      state->host_error_flag = -1;
+    return nullptr;
+  }
+  if (grow_device_buffer(static_cast<hipStream_t>(stream),
+                         state->matmul_nbits_fp16_scratch,
+                         state->matmul_nbits_fp16_scratch_size, bytes,
+                         "matmul_nbits weight scratch") != 0) {
+    state->host_error_flag = -1;
+    return nullptr;
+  }
+  return state->matmul_nbits_fp16_scratch;
+}
+
 const void *hipdnn_ep_dequant_matmul_nbits_fp16(
     RuntimeState *state, void *stream, const void *weights, const void *scales,
     const void *zeros, int n, int k, int group_size) {
@@ -106,19 +141,15 @@ const void *hipdnn_ep_dequant_matmul_nbits_fp16(
   const size_t bytes =
       static_cast<size_t>(n) * static_cast<size_t>(k) * sizeof(uint16_t);
   const size_t previous_size = state->matmul_nbits_fp16_scratch_size;
-  if (grow_device_buffer(static_cast<hipStream_t>(stream),
-                         state->matmul_nbits_fp16_scratch,
-                         state->matmul_nbits_fp16_scratch_size, bytes,
-                         "matmul_nbits fp16 scratch") != 0) {
-    state->host_error_flag = -1;
+  void *output =
+      hipdnn_ep_state_ensure_matmul_nbits_scratch(state, stream, bytes);
+  if (!output)
     return nullptr;
-  }
   if (previous_size < bytes)
     RUNTIME_DEBUG_LOG("[matmul_nbits] Allocated shared fp16 weight scratch: "
                       "%zu bytes\n",
                       bytes);
 
-  void *output = state->matmul_nbits_fp16_scratch;
   hip_matmul_nbits_dequant_b_fp16(stream, weights, scales, zeros, output, n, k,
                                   group_size);
   const hipError_t status = hipGetLastError();

@@ -2,12 +2,14 @@
  * Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  * Licensed under the MIT License.
  */
+#include "execution_status.h"
 #include "hip_custom_kernels.h"
 #include "runtime_state_internal.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -161,7 +163,73 @@ void test_launch_failure_and_independent_buffers() {
   release(state);
 }
 
+void test_execution_failure_and_retry() {
+  auto state = make_state();
+  int error = 0;
+  state.device_error_flag = &error;
+  auto run = [&] {
+    ExecutionStatusGuard status(&state);
+    if (hipdnn_ep_state_ensure_workspace(&state, 128) != 0)
+      return -1;
+    return status.Finish(0);
+  };
+  device.failure = Failure::Allocation;
+  CHECK(run() == -1);
+  CHECK(error != 0);
+  device.failure = Failure::None;
+  CHECK(run() == 0);
+  CHECK(error != 0);
+  error = 0;
+  device.calls.clear();
+  CHECK(run() == 0);
+  CHECK(error == 0);
+  CHECK(device.calls.empty());
+  {
+    ExecutionStatusGuard status(&state);
+    CHECK(status.Finish(-7) == -7);
+  }
+  CHECK(error != 0);
+  release(state);
+}
+
+void test_fp32_tiles_share_weight_scratch_not_workspace() {
+  auto state = make_state();
+  CHECK(hipdnn_ep_state_ensure_workspace(&state, 128) == 0);
+  void *workspace = state.workspace;
+  CHECK(dequantize(state) != nullptr);
+  device.calls.clear();
+  void *tile =
+      hipdnn_ep_state_ensure_matmul_nbits_scratch(&state, state.stream, 1024);
+  CHECK(tile != nullptr && tile != workspace);
+  CHECK(state.matmul_nbits_fp16_scratch_size == 1024);
+  CHECK(device.calls ==
+        (std::vector<std::string>{"drain", "free", "allocate"}));
+  device.calls.clear();
+  CHECK(dequantize(state) == tile);
+  CHECK(state.workspace == workspace && state.workspace_size == 128);
+  CHECK(device.calls == (std::vector<std::string>{"launch", "status"}));
+  release(state);
+}
+
 } // namespace
+
+extern "C" void *hipdnn_ep_state_get_stream(RuntimeState *state) {
+  return state->stream;
+}
+
+extern "C" void *
+hipdnn_ep_state_get_error_flag_device_ptr(RuntimeState *state) {
+  return state->device_error_flag;
+}
+
+extern "C" hipError_t hipMemsetAsync(void *output, int value, size_t size,
+                                     hipStream_t stream) {
+  CHECK(stream == &device);
+  CHECK(size == sizeof(int));
+  device.calls.emplace_back("record_error");
+  std::memset(output, value, size);
+  return hipSuccess;
+}
 
 extern "C" hipError_t hipMalloc(void **pointer, size_t bytes) {
   device.calls.emplace_back("allocate");
@@ -219,6 +287,8 @@ int main() {
   test_workspace_growth_and_failure();
   test_dequantization_growth_and_failure();
   test_launch_failure_and_independent_buffers();
+  test_execution_failure_and_retry();
+  test_fp32_tiles_share_weight_scratch_not_workspace();
   if (device.failures) {
     fprintf(stderr, "device scratch: %d failures\n", device.failures);
     return 1;

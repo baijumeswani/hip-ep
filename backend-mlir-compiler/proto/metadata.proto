@@ -20,6 +20,14 @@ message Metadata {
   // cache identity does not cover the arch or HIPDNN_EP_ROCMLIR, so the EP
   // refuses to load an artifact whose value differs from the current one.
   string rocmlir_arch = 5;
+  // Exact execution/compilation contract, validated before loading any code.
+  map<string, string> compatibility = 6;
+  string source_model_sha256 = 7;
+  string artifact_sha256 = 8;
+  // Externalized compiled constants and their layout descriptor.
+  map<string, string> file_sha256 = 9;
+  // An empty dependency set is valid for graphs without externalized constants.
+  uint32 external_dependency_count = 10;
 }
 
 message Input {

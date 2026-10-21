@@ -12,9 +12,34 @@
 
 static atomic_int armed;
 static atomic_int allocation_armed;
+void arm_scratch_allocation_failure(void) { atomic_store(&allocation_armed, 1); }
+static atomic_int swish_calls;
+static atomic_int swish_injections;
 
 void arm_compute_drain_failure(void) { atomic_store(&armed, 1); }
-void arm_scratch_allocation_failure(void) { atomic_store(&allocation_armed, 1); }
+void arm_swish_launch_failure(void) {
+  /* hip_swish clears a stale error before checking its actual launch. */
+  atomic_store(&swish_calls, 2);
+  atomic_store(&swish_injections, 0);
+}
+int swish_launch_failure_injections(void) {
+  return atomic_load(&swish_injections);
+}
+
+int hipGetLastError(void) {
+  Dl_info caller;
+  if (atomic_load(&swish_calls) &&
+      dladdr(__builtin_return_address(0), &caller) && caller.dli_sname &&
+      strcmp(caller.dli_sname, "hip_swish") == 0 &&
+      atomic_fetch_sub(&swish_calls, 1) == 1) {
+    atomic_fetch_add(&swish_injections, 1);
+    return 999; /* Report an error after the real, non-destructive launch. */
+  }
+  int (*last_error)(void) = (int (*)(void))dlsym(RTLD_NEXT, "hipGetLastError");
+  if (!last_error)
+    abort();
+  return last_error();
+}
 
 static void *real_symbol(void *handle, const char *name) {
   void *(*lookup)(void *, const char *) =

@@ -22,7 +22,7 @@ import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 
-def create_session(library, path, provider, ep_options):
+def create_session(library, path, provider, ep_options, swish=False):
     ort.register_execution_provider_library(provider, str(Path(library).resolve()))
     devices = [device for device in ort.get_ep_devices() if device.ep_name == provider]
     assert len(devices) == 1
@@ -56,6 +56,19 @@ def create_session(library, path, provider, ep_options):
         opset_imports=[helper.make_opsetid("", 21)],
     )
     model.ir_version = 10
+    if swish:
+        model.graph.node.insert(
+            1,
+            helper.make_node(
+                "QuickGelu",
+                ["product"],
+                ["activated"],
+                domain="com.microsoft",
+                alpha=1.0,
+            ),
+        )
+        model.opset_import.append(helper.make_opsetid("com.microsoft", 1))
+        model.graph.node[-1].input[0] = "activated"
     onnx.checker.check_model(model)
     onnx.save(model, path)
     options = ort.SessionOptions()
@@ -68,7 +81,7 @@ def create_session(library, path, provider, ep_options):
     return ort.InferenceSession(str(path), sess_options=options), device
 
 
-def run_alias(session, device, rows, before_run=None):
+def run_alias(session, device, rows, before_run=None, swish=False):
     values = np.arange(rows * 8, dtype=np.float16).reshape(rows, 8) / 8
     state = (values + 1).astype(np.float16)
     order = np.arange(rows - 1, -1, -1, dtype=np.int32)
@@ -87,7 +100,14 @@ def run_alias(session, device, rows, before_run=None):
         before_run()
     session.run_with_iobinding(binding)
     assert binding.get_outputs()[0].data_ptr() == tensors["state"].data_ptr()
-    np.testing.assert_array_equal(tensors["state"].numpy(), values + state[order])
+    if swish:
+        sigmoid = (1 / (1 + np.exp(-values.astype(np.float32)))).astype(np.float16)
+        expected = (values * sigmoid).astype(np.float16) + state[order]
+        np.testing.assert_allclose(
+            tensors["state"].numpy(), expected, atol=2e-3, rtol=2e-3
+        )
+    else:
+        np.testing.assert_array_equal(tensors["state"].numpy(), values + state[order])
 
 
 def test_existing_op_state_alias_and_failed_drain(request, tmp_path):
@@ -224,6 +244,51 @@ def run_allocation_failure(library, path, provider, ep_options, hook):
     )
 
 
+def test_swish_launch_failure_is_reported(request, tmp_path):
+    from framework.ort_ep_backend import _parse_ep_options
+
+    library = request.config.getoption("--ep-dll")
+    if not library:
+        pytest.skip("--ep-dll is required")
+    if os.name != "posix" or not Path("/proc/self/maps").exists():
+        pytest.skip("Linux launch-status interposer qualification")
+    compiler = shutil.which("cc")
+    assert compiler, "The launch-status test requires a C compiler"
+    interposer = tmp_path / "swish-status.so"
+    subprocess.run(
+        [
+            compiler,
+            "-shared",
+            "-fPIC",
+            str(Path(__file__).with_name("compute_drain_interposer.c")),
+            "-ldl",
+            "-o",
+            str(interposer),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    child = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            str(library),
+            str(tmp_path / "swish.onnx"),
+            request.config.getoption("--ep-name"),
+            json.dumps(_parse_ep_options(request.config.getoption("--ep-option"))),
+            str(interposer),
+            "swish",
+        ],
+        env={**os.environ, "LD_PRELOAD": str(interposer)},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
+    assert "Swish device execution failure propagated" in child.stdout
+
+
 if __name__ == "__main__":
     import resource
 
@@ -235,11 +300,21 @@ if __name__ == "__main__":
             library, Path(model_path), provider, json.loads(options), hook
         )
         sys.exit(0)
+    swish = sys.argv[6:] == ["swish"]
     session, device = create_session(
-        library, Path(model_path), provider, json.loads(options)
+        library, Path(model_path), provider, json.loads(options), swish=swish
     )
-    run_alias(session, device, 2)
-    run_alias(session, device, 2, before_run=hook.arm_compute_drain_failure)
-    raise AssertionError(
-        "Failed drain returned to a caller that could release its allocations"
-    )
+    run_alias(session, device, 2, swish=swish)
+    hook = ctypes.CDLL(interposer)
+    if swish:
+        hook.arm_swish_launch_failure()
+        with pytest.raises(RuntimeError, match="HIP compiled device execution failed"):
+            run_alias(session, device, 2, swish=True)
+        assert hook.swish_launch_failure_injections() == 1
+        run_alias(session, device, 2, swish=True)
+        print("Swish device execution failure propagated")
+    else:
+        run_alias(session, device, 2, before_run=hook.arm_compute_drain_failure)
+        raise AssertionError(
+            "Failed drain returned to a caller that could release its allocations"
+        )

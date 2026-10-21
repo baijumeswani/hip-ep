@@ -3,13 +3,11 @@
  * Licensed under the MIT License.
  */
 
-// Slice (ONNX-13+) -- non-constant indices / negative-step fallback.
+// Slice (ONNX-13+) -- runtime clamping and negative-step fallback.
 //
-// The compile-time-constant + positive-stride case is folded upstream to
-// `tensor.extract_slice` (see lib/Conversion/OnnxToHip/SliceConversion.cpp
-// ::SliceDecompose), so this entry point only fires for slices whose
-// `starts` / `ends` / `axes` / `steps` are not graph-constant (or that
-// use negative steps).
+// Constant positive-stride slices on static axes fold to tensor.extract_slice.
+// wrap_slice_host takes constant bounds in host arrays when dynamic axes or
+// negative steps still require runtime clamping; wrap_slice reads GPU bounds.
 //
 // Per ONNX-13+ Slice spec:
 //
@@ -22,17 +20,14 @@
 //       step > 0: start in [0, dim], end in [0, dim].
 //       step < 0: start in [0, dim-1], end in [-1, dim-1].
 //
-// Output shape is statically known (the SliceToHip lowering enforces
-// this), so the only work we do at runtime is:
+// The output capacity is supplied by SliceToHip. Runtime work is:
 //
-//   1. D2H of starts / ends / (optional) axes / (optional) steps.
+//   1. D2H of dynamic bounds, or direct access to constant host bounds.
 //   2. Resolve to per-input-axis (start, step) per ONNX rules.
 //   3. Launch `hip_slice` -- one thread per output element.
 //
-// We assume the four index tensors are INT64 -- the standard ONNX form
-// and what every test in the LIT suite uses. If a model produces INT32
-// index tensors we will need to dispatch on stride (the ABI omits the
-// dtype for these operands today).
+// GPU index tensors must be INT64. Constant host bounds are normalized to
+// INT64 by the compiler, including constants originally stored as INT32.
 
 #include "../debug_log.h"
 #include "../execution_status.h"
@@ -70,7 +65,8 @@ static int RunSlice(RuntimeState *state, void *data, void *starts, void *ends,
                     const int64_t *data_shape, int64_t data_rank,
                     const int64_t *output_shape, int64_t output_rank,
                     int64_t starts_num_elements, int64_t axes_num_elements,
-                    int64_t steps_num_elements, int64_t data_type) {
+                    int64_t steps_num_elements, int64_t data_type,
+                    bool host_indices = false) {
   // (Slice runtime entry trace removed; was used for the slice-empty-buffer
   // root-cause investigation. Re-add with a HIPDNN_EP_DEBUG gate if needed.)
   OP_PROFILE(
@@ -173,21 +169,23 @@ static int RunSlice(RuntimeState *state, void *data, void *starts, void *ends,
   std::vector<int64_t> axes_host;
   std::vector<int64_t> steps_host;
 
-  hipError_t err =
-      hipMemcpyAsync(starts_host.data(), starts, K * sizeof(int64_t),
-                     hipMemcpyDeviceToHost, hip_stream);
-  if (err != hipSuccess) {
-    fprintf(stderr, "[REAL] wrap_slice: starts D2H failed: %s\n",
+  auto copy_indices = [&](std::vector<int64_t> &destination, void *source,
+                          const char *name) {
+    if (host_indices) {
+      std::copy_n(static_cast<const int64_t *>(source), K, destination.begin());
+      return true;
+    }
+    auto err = hipMemcpyAsync(destination.data(), source, K * sizeof(int64_t),
+                              hipMemcpyDeviceToHost, hip_stream);
+    if (err == hipSuccess)
+      return true;
+    fprintf(stderr, "[REAL] wrap_slice: %s D2H failed: %s\n", name,
             hipGetErrorString(err));
+    return false;
+  };
+  if (!copy_indices(starts_host, starts, "starts") ||
+      !copy_indices(ends_host, ends, "ends"))
     return -1;
-  }
-  err = hipMemcpyAsync(ends_host.data(), ends, K * sizeof(int64_t),
-                       hipMemcpyDeviceToHost, hip_stream);
-  if (err != hipSuccess) {
-    fprintf(stderr, "[REAL] wrap_slice: ends D2H failed: %s\n",
-            hipGetErrorString(err));
-    return -1;
-  }
 
   if (axes && axes_num_elements > 0) {
     if (axes_num_elements != K) {
@@ -198,13 +196,8 @@ static int RunSlice(RuntimeState *state, void *data, void *starts, void *ends,
       return -1;
     }
     axes_host.resize(K);
-    err = hipMemcpyAsync(axes_host.data(), axes, K * sizeof(int64_t),
-                         hipMemcpyDeviceToHost, hip_stream);
-    if (err != hipSuccess) {
-      fprintf(stderr, "[REAL] wrap_slice: axes D2H failed: %s\n",
-              hipGetErrorString(err));
+    if (!copy_indices(axes_host, axes, "axes"))
       return -1;
-    }
   }
 
   if (steps && steps_num_elements > 0) {
@@ -216,20 +209,17 @@ static int RunSlice(RuntimeState *state, void *data, void *starts, void *ends,
       return -1;
     }
     steps_host.resize(K);
-    err = hipMemcpyAsync(steps_host.data(), steps, K * sizeof(int64_t),
-                         hipMemcpyDeviceToHost, hip_stream);
+    if (!copy_indices(steps_host, steps, "steps"))
+      return -1;
+  }
+
+  if (!host_indices) {
+    auto err = hipStreamSynchronize(hip_stream);
     if (err != hipSuccess) {
-      fprintf(stderr, "[REAL] wrap_slice: steps D2H failed: %s\n",
+      fprintf(stderr, "[REAL] wrap_slice: stream sync after D2H failed: %s\n",
               hipGetErrorString(err));
       return -1;
     }
-  }
-
-  err = hipStreamSynchronize(hip_stream);
-  if (err != hipSuccess) {
-    fprintf(stderr, "[REAL] wrap_slice: stream sync after D2H failed: %s\n",
-            hipGetErrorString(err));
-    return -1;
   }
 
   // Build per-input-axis (start, step) arrays. Axes not listed in `axes`
@@ -401,4 +391,17 @@ int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
       RunSlice(state, data, starts, ends, axes, steps, output, data_shape,
                data_rank, output_shape, output_rank, starts_num_elements,
                axes_num_elements, steps_num_elements, data_type));
+}
+
+int wrap_slice_host(RuntimeState *state, void *data, void *starts, void *ends,
+                    void *axes, void *steps, void *output,
+                    const int64_t *data_shape, int64_t data_rank,
+                    const int64_t *output_shape, int64_t output_rank,
+                    int64_t starts_num_elements, int64_t axes_num_elements,
+                    int64_t steps_num_elements, int64_t data_type) {
+  ExecutionStatusGuard execution_status(state);
+  return execution_status.Finish(
+      RunSlice(state, data, starts, ends, axes, steps, output, data_shape,
+               data_rank, output_shape, output_rank, starts_num_elements,
+               axes_num_elements, steps_num_elements, data_type, true));
 }

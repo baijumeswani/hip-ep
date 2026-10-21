@@ -59,12 +59,15 @@ def _distinct_rows(rng, rows: int, cols: int) -> np.ndarray:
 
 class TestTopK:
     @pytest.mark.parametrize("largest", [0, 1])
-    def test_wide_nan_preserves_legacy_scan(self, model_runner, largest):
+    @pytest.mark.parametrize("k", [3, 16])
+    def test_wide_nan_preserves_legacy_scan(self, model_runner, largest, k):
         values = np.tile(np.arange(257, dtype=np.float32), (2, 1))
         values[0, 0] = values[1, 1] = np.nan
-        model = _make_topk_model([2, 257], 3, axis=1, largest=largest, sorted_=1)
+        model = _make_topk_model([2, 257], k, axis=1, largest=largest, sorted_=1)
         chosen = np.array(
-            [[0, 256, 255], [256, 255, 254]] if largest else [[0, 1, 2], [0, 1, 2]],
+            [[0, *range(256, 257 - k, -1)], list(range(256, 256 - k, -1))]
+            if largest
+            else [list(range(k)), list(range(k))],
             dtype=np.int64,
         )
         expected_values = np.take_along_axis(values, chosen, axis=1)

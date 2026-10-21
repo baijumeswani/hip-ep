@@ -17,11 +17,8 @@ namespace {
 //                 starts_num_elements, axes_num_elements,
 //                 steps_num_elements, data_type)
 //
-// Today the runtime function is a no-op stub that only logs its parameters
-// (see lib/Runtime/real/slice.cpp). This lowering exists to keep the IR
-// pipeline (bufferize -> hip-to-llvm -> generate-interface) functional even
-// when a Slice cannot be folded to tensor.extract_slice by the OnnxToHip
-// decompose pattern.
+// Constant bounds on dynamic axes still need runtime clamping. Materialize
+// those bounds on the host instead of reading immutable GPU tensors back.
 struct SliceOpLowering : public ConvertOpToLLVMPattern<SliceOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -100,6 +97,51 @@ struct SliceOpLowering : public ConvertOpToLLVMPattern<SliceOp> {
     Value dataRank = createI64Const(dataType.getRank());
     Value outRank = createI64Const(outputType.getRank());
     Value dataTypeVal = createI64Const(hipDtype);
+    auto constantStarts =
+        op->getAttrOfType<DenseI64ArrayAttr>("hipdnn.constant_starts");
+    auto constantEnds =
+        op->getAttrOfType<DenseI64ArrayAttr>("hipdnn.constant_ends");
+    auto constantAxes =
+        op->getAttrOfType<DenseI64ArrayAttr>("hipdnn.constant_axes");
+    auto constantSteps =
+        op->getAttrOfType<DenseI64ArrayAttr>("hipdnn.constant_steps");
+    bool hostIndices =
+        constantStarts && constantEnds && constantAxes && constantSteps;
+    if ((constantStarts || constantEnds || constantAxes || constantSteps) &&
+        !hostIndices)
+      return rewriter.notifyMatchFailure(op,
+                                         "incomplete constant Slice bounds");
+    if (hostIndices) {
+      auto count = constantStarts.size();
+      if (!count || constantEnds.size() != count ||
+          (op.getAxes() ? constantAxes.size() != count
+                        : !constantAxes.empty()) ||
+          (op.getSteps() ? constantSteps.size() != count
+                         : !constantSteps.empty()))
+        return rewriter.notifyMatchFailure(
+            op, "inconsistent constant Slice bounds");
+      auto emitIndices = [&](DenseI64ArrayAttr values) -> Value {
+        if (values.empty())
+          return LLVM::ZeroOp::create(rewriter, loc, ptrType);
+        auto arrayType = LLVM::LLVMArrayType::get(i64Type, values.size());
+        Value array =
+            LLVM::AllocaOp::create(rewriter, loc, ptrType, arrayType, one, 8);
+        for (auto [index, value] : llvm::enumerate(values.asArrayRef())) {
+          Value offset = createI64Const(index);
+          Value pointer = LLVM::GEPOp::create(rewriter, loc, ptrType, i64Type,
+                                              array, offset);
+          LLVM::StoreOp::create(rewriter, loc, createI64Const(value), pointer);
+        }
+        return array;
+      };
+      startsPtr = emitIndices(constantStarts);
+      endsPtr = emitIndices(constantEnds);
+      axesPtr = emitIndices(constantAxes);
+      stepsPtr = emitIndices(constantSteps);
+      startsNum = createI64Const(count);
+      axesNum = createI64Const(constantAxes.size());
+      stepsNum = createI64Const(constantSteps.size());
+    }
 
     SmallVector<Type, 16> paramTypes = {
         ptrType, ptrType, ptrType, ptrType, // state, data, starts, ends
@@ -111,7 +153,8 @@ struct SliceOpLowering : public ConvertOpToLLVMPattern<SliceOp> {
         i64Type};                           // data_type
 
     FailureOr<LLVM::LLVMFuncOp> funcOp = LLVM::lookupOrCreateFn(
-        rewriter, module, kWrapSlice, paramTypes, i32Type);
+        rewriter, module, hostIndices ? kWrapSliceHost : kWrapSlice, paramTypes,
+        i32Type);
     if (failed(funcOp))
       return failure();
 

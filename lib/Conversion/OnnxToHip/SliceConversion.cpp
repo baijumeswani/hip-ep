@@ -37,7 +37,10 @@ namespace {
 //     long after that landed). Worth knowing when reading the extent logic
 //     below: that runtime D2Hs starts/ends/axes/steps and synchronizes the
 //     stream on every call, so this op already costs a host sync per
-//     execution. Dynamic output dims are computed from
+//     execution for dynamic bounds. Fully constant bounds are retained as
+//     hipdnn.constant_{starts,ends,axes,steps} arrays and lowered to
+//     wrap_slice_host without device readback or synchronization. Dynamic
+//     output dims are computed from
 //     the slice bounds when those are host-resolvable, and otherwise fall back
 //     to `tensor.dim` on `data` (an upper bound — Slice cannot widen any axis).
 //
@@ -615,6 +618,25 @@ struct SliceToHip : public mlir::RewritePattern {
 
     auto hipOp = mlir::hip::SliceOp::create(rewriter, loc, context, data,
                                             starts, ends, axes, steps, init);
+    llvm::SmallVector<int64_t> constantStarts, constantEnds, constantAxes,
+        constantSteps;
+    if (mlir::succeeded(extractSliceParamVector(op, "hipdnn.slice_starts",
+                                                starts, constantStarts)) &&
+        mlir::succeeded(extractSliceParamVector(op, "hipdnn.slice_ends", ends,
+                                                constantEnds)) &&
+        (!axes || mlir::succeeded(extractSliceParamVector(
+                      op, "hipdnn.slice_axes", axes, constantAxes))) &&
+        (!steps || mlir::succeeded(extractSliceParamVector(
+                       op, "hipdnn.slice_steps", steps, constantSteps)))) {
+      hipOp->setAttr("hipdnn.constant_starts",
+                     rewriter.getDenseI64ArrayAttr(constantStarts));
+      hipOp->setAttr("hipdnn.constant_ends",
+                     rewriter.getDenseI64ArrayAttr(constantEnds));
+      hipOp->setAttr("hipdnn.constant_axes",
+                     rewriter.getDenseI64ArrayAttr(constantAxes));
+      hipOp->setAttr("hipdnn.constant_steps",
+                     rewriter.getDenseI64ArrayAttr(constantSteps));
+    }
     rewriter.replaceOp(op, hipOp->getResult(0));
     return mlir::success();
   }

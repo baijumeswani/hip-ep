@@ -463,6 +463,43 @@ def _make_slice_model(
 
 
 class TestSlice:
+    @pytest.mark.parametrize(
+        "start,end,axes,steps",
+        [
+            (0, 1, None, None),
+            (-4, np.iinfo(np.int64).max, [-2], [1]),
+            (-1, np.iinfo(np.int64).min, [0], [-1]),
+        ],
+    )
+    def test_bfloat16_constant_bounds_dynamic_axis(
+        self, model_runner, start, end, axes, steps
+    ):
+        model, _ = _make_slice_model(
+            np.float32, [None, 6], [start], [end], axes, steps, [None, 6], True
+        )
+        reference = make_model_from_nodes(
+            list(model.graph.node),
+            list(model.graph.input),
+            list(model.graph.output),
+            initializers=list(model.graph.initializer),
+        )
+        model.graph.node[0].input[0] = "bfloat_input"
+        model.graph.node[0].output[0] = "bfloat_output"
+        model.graph.node.insert(
+            0,
+            helper.make_node("Cast", ["X"], ["bfloat_input"], to=TensorProto.BFLOAT16),
+        )
+        model.graph.node.append(
+            helper.make_node("Cast", ["bfloat_output"], ["Y"], to=TensorProto.FLOAT)
+        )
+        for rows in (1, 2, 8, 17, 1):
+            data = np.arange(rows * 6, dtype=np.float32).reshape(rows, 6) * 1e20
+            data = data.astype(bfloat16).astype(np.float32)
+            actual, expected = model_runner.run_sample(
+                model, [data], reference="cpu", reference_model=reference
+            )
+            np.testing.assert_array_equal(actual[0], expected[0])
+
     @pytest.mark.parametrize("step", [1, -1])
     def test_bfloat16_runtime(self, model_runner, step):
         starts, ends = ([2], [6]) if step == 1 else ([5], [1])

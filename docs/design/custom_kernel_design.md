@@ -42,6 +42,27 @@ flowchart TD
 
 Key insight: The `.hip` files contain `__global__` kernels compiled by hipcc into fat binaries (host + device code). They live in `custom_kernels_<arch>.{dll,so}` co-located with the EP binary, NOT inside the per-model artifact. `LlvmIrJit` resolves `hip_*` launcher symbols against this shared library at JIT init via `DynamicLibrarySearchGenerator::Load`, anchored on `GetModuleFileName` / `dladdr` of the EP DLL.
 
+## Typed INT4 activation loads
+
+The raw symmetric INT4/block-32 small-M path supports FP32 and BF16
+activations with FP32 accumulation. Aligned BF16 rows load eight values as
+one `uint4` and expand their bit patterns to FP32; this does not round the
+activations or change the dot-product accumulation order. Vector loading
+requires a 16-byte-aligned activation pointer and K divisible by 32. Other
+inputs retain the scalar tail-safe path. One-/four-row weight sharing and
+the bounded tiled-dequantization path for larger M are unchanged.
+
+## Exact FP32 TopK selection
+
+Last-axis FP32 K=16 selection scans each row once, retaining sixteen
+candidates per thread before reducing candidate heads across the block.
+Packed 64-bit ordered-value/index keys preserve lower-index ties, treat
+signed zeros as equal, and distinguish empty candidates from infinities.
+Selected values are loaded from their original indices to preserve their
+bits. Any NaN uses the legacy serial selector, preserving its
+order-dependent semantics. Other K values, axes, and supported dtypes keep
+their existing paths.
+
 ## Directory Structure
 
 ```

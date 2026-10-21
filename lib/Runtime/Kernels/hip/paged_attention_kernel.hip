@@ -105,13 +105,18 @@ __device__ void StoreInt8Cache(float value, float scale, int8_t *cache,
   cache[256] = static_cast<int8_t>(code - 256 * high - 128);
 }
 
+__device__ float DecodeInt8Cache(int high, int low, float scale,
+                                 int residual_bits) {
+  if (!residual_bits)
+    return static_cast<float>(high) * scale;
+  const int code = 256 * high + low + 128;
+  return static_cast<float>(code) * (scale / 256.0f);
+}
+
 __device__ float ReadInt8Cache(const int8_t *cache, float scale,
                                int residual_bits) {
-  if (!residual_bits)
-    return static_cast<float>(cache[0]) * scale;
-  const int code = 256 * static_cast<int>(cache[0]) +
-                   static_cast<int>(cache[256]) + 128;
-  return static_cast<float>(code) * (scale / 256.0f);
+  return DecodeInt8Cache(cache[0], residual_bits ? cache[256] : 0, scale,
+                          residual_bits);
 }
 
 __device__ int RequestForToken(const int32_t *cumulative, int token, int batch) {
@@ -355,6 +360,27 @@ __global__ void PackQuery(const float *query, float *packed, int queries,
       query[(static_cast<int64_t>(token) * heads + head) * 256 + threadIdx.x];
 }
 
+template <bool Maximum>
+__device__ float ReduceAttentionTile(float value, float *shared) {
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  for (int offset = warpSize / 2; offset; offset /= 2) {
+    const float other = __shfl_xor(value, offset);
+    value = Maximum ? fmaxf(value, other) : value + other;
+  }
+  if (lane == 0)
+    shared[wave] = value;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    value = shared[0];
+    for (int index = 1; index < blockDim.x / warpSize; ++index)
+      value = Maximum ? fmaxf(value, shared[index]) : value + shared[index];
+    shared[0] = value;
+  }
+  __syncthreads();
+  return shared[0];
+}
+
 __global__ void PackInt8Cache(
     const int8_t *key_cache, const int8_t *value_cache, const int32_t *table,
     const float *key_scale, const float *value_scale, float *key, float *value,
@@ -378,53 +404,88 @@ __global__ void PackInt8Cache(
                                       residual_bits);
 }
 
+__global__ void PackInt8CacheVector(
+    const int8_t *key_cache, const int8_t *value_cache, const int32_t *table,
+    const float *key_scale, const float *value_scale, float *key, float *value,
+    int begin, int count, int page_size, int kv_heads, const int *error,
+    int residual_bits) {
+  const int position = blockIdx.x * 2 + threadIdx.x / 64;
+  if (*error || position >= count)
+    return;
+  const int head = blockIdx.y;
+  const int dimension = (threadIdx.x % 64) * 4;
+  const int channel = head * 256 + dimension;
+  const int absolute_position = begin + position;
+  const int page = table[absolute_position / page_size];
+  const int width = residual_bits ? 512 : 256;
+  const int64_t source =
+      ((static_cast<int64_t>(page) * page_size + absolute_position % page_size) *
+           kv_heads + head) * width + dimension;
+  const uint32_t key_high =
+      *reinterpret_cast<const uint32_t *>(key_cache + source);
+  const uint32_t value_high =
+      *reinterpret_cast<const uint32_t *>(value_cache + source);
+  const uint32_t key_low = residual_bits
+      ? *reinterpret_cast<const uint32_t *>(key_cache + source + 256) : 0;
+  const uint32_t value_low = residual_bits
+      ? *reinterpret_cast<const uint32_t *>(value_cache + source + 256) : 0;
+  const float4 ks = *reinterpret_cast<const float4 *>(key_scale + channel);
+  const float4 vs = *reinterpret_cast<const float4 *>(value_scale + channel);
+  const float key_scales[4] = {ks.x, ks.y, ks.z, ks.w};
+  const float value_scales[4] = {vs.x, vs.y, vs.z, vs.w};
+  float decoded_key[4], decoded_value[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    decoded_key[i] = DecodeInt8Cache(
+        static_cast<int8_t>(key_high >> (i * 8)),
+        static_cast<int8_t>(key_low >> (i * 8)), key_scales[i], residual_bits);
+    decoded_value[i] = DecodeInt8Cache(
+        static_cast<int8_t>(value_high >> (i * 8)),
+        static_cast<int8_t>(value_low >> (i * 8)), value_scales[i], residual_bits);
+  }
+  const int64_t destination =
+      (static_cast<int64_t>(head) * count + position) * 256 + dimension;
+  *reinterpret_cast<float4 *>(key + destination) = make_float4(
+      decoded_key[0], decoded_key[1], decoded_key[2], decoded_key[3]);
+  *reinterpret_cast<float4 *>(value + destination) = make_float4(
+      decoded_value[0], decoded_value[1], decoded_value[2], decoded_value[3]);
+}
+
 __global__ void OnlineSoftmax(
     float *scores, float *statistics, int queries, int keys, int heads,
     int kv_heads, int query_position, int key_position, float scale,
     const int *error) {
   if (*error)
     return;
-  __shared__ float reduction[kThreads];
+  __shared__ float maximum_reduction[16];
+  __shared__ float sum_reduction[16];
   const int row = blockIdx.x;
   const int thread = threadIdx.x;
   const int rows = queries * heads;
   const int query = (row % (queries * (heads / kv_heads))) / (heads / kv_heads);
   float *values = scores + static_cast<int64_t>(row) * keys;
   float maximum = -INFINITY;
-  for (int column = thread; column < keys; column += kThreads) {
+  for (int column = thread; column < keys; column += blockDim.x) {
     const float score = key_position + column <= query_position + query
                             ? values[column] * scale
                             : -INFINITY;
     values[column] = score;
     maximum = fmaxf(maximum, score);
   }
-  reduction[thread] = maximum;
-  __syncthreads();
-  for (int width = kThreads / 2; width; width /= 2) {
-    if (thread < width)
-      reduction[thread] = fmaxf(reduction[thread], reduction[thread + width]);
-    __syncthreads();
-  }
+  maximum = ReduceAttentionTile<true>(maximum, maximum_reduction);
   const float previous_maximum = key_position == 0 ? -INFINITY : statistics[row];
   const float previous_sum = key_position == 0 ? 0 : statistics[rows + row];
-  maximum = fmaxf(reduction[0], previous_maximum);
-  __syncthreads();
+  maximum = fmaxf(maximum, previous_maximum);
   const float correction = expf(previous_maximum - maximum);
   float sum = 0;
-  for (int column = thread; column < keys; column += kThreads) {
+  for (int column = thread; column < keys; column += blockDim.x) {
     values[column] = expf(values[column] - maximum);
     sum += values[column];
   }
-  reduction[thread] = sum;
-  __syncthreads();
-  for (int width = kThreads / 2; width; width /= 2) {
-    if (thread < width)
-      reduction[thread] += reduction[thread + width];
-    __syncthreads();
-  }
+  sum = ReduceAttentionTile<false>(sum, sum_reduction);
   if (thread == 0) {
     statistics[row] = maximum;
-    statistics[rows + row] = correction * previous_sum + reduction[0];
+    statistics[rows + row] = correction * previous_sum + sum;
     statistics[2 * rows + row] = correction;
   }
 }
@@ -810,10 +871,24 @@ extern "C" HIP_KERNEL_API int hip_paged_int8_pack_cache(
   if (residual_bits != 0 && residual_bits != 8)
     return hipErrorInvalidValue;
   (void)hipGetLastError();
-  hipLaunchKernelGGL(PackInt8Cache, dim3(count, kv_heads), dim3(256), 0,
-                    static_cast<hipStream_t>(stream), key_cache, value_cache,
-                    table, key_scale, value_scale, key, value, begin, count,
-                    page_size, kv_heads, error, residual_bits);
+  const uintptr_t addresses =
+      reinterpret_cast<uintptr_t>(key_cache) |
+      reinterpret_cast<uintptr_t>(value_cache) |
+      reinterpret_cast<uintptr_t>(key_scale) |
+      reinterpret_cast<uintptr_t>(value_scale) |
+      reinterpret_cast<uintptr_t>(key) | reinterpret_cast<uintptr_t>(value);
+  if ((addresses & (alignof(float4) - 1)) == 0) {
+    hipLaunchKernelGGL(
+        PackInt8CacheVector, dim3((static_cast<int64_t>(count) + 1) / 2, kv_heads),
+        dim3(128), 0, static_cast<hipStream_t>(stream), key_cache, value_cache,
+        table, key_scale, value_scale, key, value, begin, count, page_size,
+        kv_heads, error, residual_bits);
+  } else {
+    hipLaunchKernelGGL(PackInt8Cache, dim3(count, kv_heads), dim3(256), 0,
+                      static_cast<hipStream_t>(stream), key_cache, value_cache,
+                      table, key_scale, value_scale, key, value, begin, count,
+                      page_size, kv_heads, error, residual_bits);
+  }
   return hipdnn_device_execution_status(hipGetLastError());
 }
 
@@ -822,7 +897,8 @@ extern "C" HIP_KERNEL_API int hip_paged_int8_softmax(
     int heads, int kv_heads, int query_position, int key_position, float scale,
     int *error) {
   (void)hipGetLastError();
-  hipLaunchKernelGGL(OnlineSoftmax, dim3(queries * heads), dim3(kThreads), 0,
+  const int threads = queries * heads <= 256 && keys >= 2048 ? 512 : kThreads;
+  hipLaunchKernelGGL(OnlineSoftmax, dim3(queries * heads), dim3(threads), 0,
                     static_cast<hipStream_t>(stream), scores, statistics,
                     queries, keys, heads, kv_heads, query_position,
                     key_position, scale, error);

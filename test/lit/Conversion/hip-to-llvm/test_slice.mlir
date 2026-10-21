@@ -38,6 +38,37 @@ module {
         outs(%output : memref<4xf32, 1>)
     return
   }
+
+  func.func @test_slice_host_bounds(%ctx: !hip.context,
+      %data: memref<?x6xbf16, 1>, %starts: memref<1xi64, 1>,
+      %ends: memref<1xi64, 1>, %axes: memref<1xi64, 1>,
+      %steps: memref<1xi64, 1>, %output: memref<?x6xbf16, 1>) {
+    hip.slice(%ctx)
+        ins(%data, %starts, %ends :
+            memref<?x6xbf16, 1>, memref<1xi64, 1>, memref<1xi64, 1>)
+        axes(%axes : memref<1xi64, 1>)
+        steps(%steps : memref<1xi64, 1>)
+        outs(%output : memref<?x6xbf16, 1>)
+        {hipdnn.constant_starts = array<i64: -1>,
+         hipdnn.constant_ends = array<i64: -9223372036854775808>,
+         hipdnn.constant_axes = array<i64: 0>,
+         hipdnn.constant_steps = array<i64: -1>}
+    return
+  }
+
+  func.func @test_slice_host_defaults(%ctx: !hip.context,
+      %data: memref<?xf32, 1>, %starts: memref<1xi64, 1>,
+      %ends: memref<1xi64, 1>, %output: memref<?xf32, 1>) {
+    hip.slice(%ctx)
+        ins(%data, %starts, %ends :
+            memref<?xf32, 1>, memref<1xi64, 1>, memref<1xi64, 1>)
+        outs(%output : memref<?xf32, 1>)
+        {hipdnn.constant_starts = array<i64: 0>,
+         hipdnn.constant_ends = array<i64: 3>,
+         hipdnn.constant_axes = array<i64>,
+         hipdnn.constant_steps = array<i64>}
+    return
+  }
 }
 
 // Each variant emits the same 15-parameter wrap_slice signature
@@ -50,3 +81,12 @@ module {
 // CHECK: llvm.mlir.zero : !llvm.ptr
 // CHECK: llvm.mlir.zero : !llvm.ptr
 // CHECK: llvm.call @wrap_slice({{.*}}) : (!llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, i64, !llvm.ptr, i64, i64, i64, i64, i64) -> i32
+
+// CHECK-LABEL: llvm.func @test_slice_host_bounds
+// CHECK: llvm.alloca
+// CHECK: llvm.store
+// CHECK: llvm.call @wrap_slice_host(
+
+// CHECK-LABEL: llvm.func @test_slice_host_defaults
+// CHECK: llvm.mlir.zero : !llvm.ptr
+// CHECK: llvm.call @wrap_slice_host(

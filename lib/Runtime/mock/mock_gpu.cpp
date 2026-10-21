@@ -2497,6 +2497,17 @@ int wrap_gather_nd(RuntimeState *state, void *data, void *indices, void *output,
   return 0;
 }
 
+int wrap_slice_host(RuntimeState *state, void *data, void *starts, void *ends,
+                    void *axes, void *steps, void *output,
+                    const int64_t *data_shape, int64_t data_rank,
+                    const int64_t *output_shape, int64_t output_rank,
+                    int64_t starts_num_elements, int64_t axes_num_elements,
+                    int64_t steps_num_elements, int64_t data_type) {
+  return wrap_slice(state, data, starts, ends, axes, steps, output, data_shape,
+                    data_rank, output_shape, output_rank, starts_num_elements,
+                    axes_num_elements, steps_num_elements, data_type);
+}
+
 int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
                void *axes, void *steps, void *output, const int64_t *data_shape,
                int64_t data_rank, const int64_t *output_shape,

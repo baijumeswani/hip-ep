@@ -138,6 +138,7 @@ __global__ void top_k_kernel(const T *__restrict__ data, T *__restrict__ values,
   topk_row(data, values, indices, geom, row_id, largest, sorted);
 }
 
+template <bool CacheTop16>
 __global__ void top_k_last_axis_f32(
     const float *__restrict__ data, float *__restrict__ values,
     int64_t *__restrict__ indices, TopKGeom geom, int largest, int sorted) {
@@ -157,20 +158,58 @@ __global__ void top_k_last_axis_f32(
     return ai >= 0 &&
            (bi < 0 || (largest ? a > b : a < b) || (a == b && ai < bi));
   };
-  for (int64_t selected = 0; selected < geom.k; ++selected) {
-    float best = 0;
-    int64_t best_index = -1;
+  uint64_t local_keys[16];
+  if constexpr (CacheTop16) {
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      local_keys[i] = 0;
+    }
     bool nan_seen = false;
     for (int64_t i = lane; i < geom.axis_size; i += threads) {
       const float candidate = data[row * geom.axis_size + i];
       nan_seen |= isnan(candidate);
-      if (selected != 0 &&
-          (i == previous_index ||
-           better(candidate, i, previous_value, previous_index)))
-        continue;
-      if (better(candidate, i, best, best_index)) {
-        best = candidate;
-        best_index = i;
+      const uint32_t bits = __float_as_uint(candidate == 0 ? 0.0f : candidate);
+      uint32_t ordered = (bits & 0x80000000u) ? ~bits : bits ^ 0x80000000u;
+      if (!largest)
+        ordered = ~ordered;
+      uint64_t key = (static_cast<uint64_t>(ordered) << 32) |
+                     (UINT32_MAX - static_cast<uint32_t>(i));
+      if (!isnan(candidate) && key > local_keys[15]) {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          if (key > local_keys[j]) {
+            const uint64_t old = local_keys[j];
+            local_keys[j] = key;
+            key = old;
+          }
+        }
+      }
+    }
+    if (nan_seen)
+      atomicExch(&has_nan, 1);
+    __syncthreads();
+  }
+  for (int64_t selected = 0; selected < geom.k; ++selected) {
+    float best = 0;
+    int64_t best_index = -1;
+    bool nan_seen = false;
+    if constexpr (CacheTop16) {
+      if (local_keys[0] != 0) {
+        best_index = UINT32_MAX - static_cast<uint32_t>(local_keys[0]);
+        best = data[row * geom.axis_size + best_index];
+      }
+    } else {
+      for (int64_t i = lane; i < geom.axis_size; i += threads) {
+        const float candidate = data[row * geom.axis_size + i];
+        nan_seen |= isnan(candidate);
+        if (selected != 0 &&
+            (i == previous_index ||
+             better(candidate, i, previous_value, previous_index)))
+          continue;
+        if (better(candidate, i, best, best_index)) {
+          best = candidate;
+          best_index = i;
+        }
       }
     }
     if (nan_seen)
@@ -200,6 +239,16 @@ __global__ void top_k_last_axis_f32(
       indices[row * geom.k + selected] = previous_index;
     }
     __syncthreads();
+    if constexpr (CacheTop16) {
+      if (local_keys[0] != 0 &&
+          UINT32_MAX - static_cast<uint32_t>(local_keys[0]) == previous_index) {
+#pragma unroll
+        for (int i = 0; i < 15; ++i) {
+          local_keys[i] = local_keys[i + 1];
+        }
+        local_keys[15] = 0;
+      }
+    }
   }
 }
 
@@ -296,12 +345,21 @@ extern "C" int hip_top_k(void *stream, const void *data, void *values,
       geom.axis_size >= 256 && geom.k <= 32 &&
       geom.num_rows > 0 && geom.num_rows <= INT32_MAX) {
     (void)hipGetLastError();
-    hipLaunchKernelGGL(
-        top_k_last_axis_f32, dim3(static_cast<unsigned>(geom.num_rows)),
-        dim3(256), 0, static_cast<hipStream_t>(stream),
-        static_cast<const float *>(data), static_cast<float *>(values),
-        static_cast<int64_t *>(indices), geom, static_cast<int>(largest),
-        static_cast<int>(sorted));
+    if (geom.k == 16 && geom.axis_size <= INT32_MAX) {
+      hipLaunchKernelGGL(
+          HIP_KERNEL_NAME(top_k_last_axis_f32<true>),
+          dim3(static_cast<unsigned>(geom.num_rows)), dim3(256), 0,
+          static_cast<hipStream_t>(stream), static_cast<const float *>(data),
+          static_cast<float *>(values), static_cast<int64_t *>(indices), geom,
+          static_cast<int>(largest), static_cast<int>(sorted));
+    } else {
+      hipLaunchKernelGGL(
+          HIP_KERNEL_NAME(top_k_last_axis_f32<false>),
+          dim3(static_cast<unsigned>(geom.num_rows)), dim3(256), 0,
+          static_cast<hipStream_t>(stream), static_cast<const float *>(data),
+          static_cast<float *>(values), static_cast<int64_t *>(indices), geom,
+          static_cast<int>(largest), static_cast<int>(sorted));
+    }
     const auto status = hipGetLastError();
     if (status != hipSuccess)
       fprintf(stderr, "[custom_kernels] parallel TopK launch failed: %s\n",

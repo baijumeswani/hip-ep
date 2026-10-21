@@ -154,6 +154,7 @@ module {
     // CHECK: %[[CAP:.*]] = arith.select %[[EMPTY]], %[[DIM]], %[[EXT]] : index
     // CHECK: tensor.empty(%[[CAP]]) : tensor<?xf32>
     // CHECK: hip.slice({{.*}}) ins({{.*}}, {{.*}}, {{.*}} : tensor<?xf32>, tensor<1xi64>, tensor<1xi64>)
+    // CHECK-SAME: hipdnn.constant_starts = array<i64: 1>
     return %r : tensor<?xf32>
   }
 

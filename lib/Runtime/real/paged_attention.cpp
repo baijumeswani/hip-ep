@@ -84,8 +84,11 @@ int wrap_paged_attention_int8(
     return fail("cache byte extent overflows int64");
 
   const bool decode = tokens == batch;
-  int query_tile = decode ? 1 : 256;
-  int key_tile = decode ? 16384 : 4096;
+  // Long KV tiles amortize short-query launches; prefill tiles stay within
+  // the same fixed workspace ceiling.
+  int query_tile =
+      static_cast<int>(std::min<int64_t>(tokens, decode ? 1 : 512));
+  int key_tile = tokens <= 32 ? 16384 : 3072;
   const auto workspace_elements = [&](int queries, int keys) {
     return 3 * static_cast<size_t>(heads) * queries * 256 +
            2 * static_cast<size_t>(kv_heads) * keys * 256 +
@@ -104,6 +107,8 @@ int wrap_paged_attention_int8(
   const size_t score_elements =
       static_cast<size_t>(heads) * query_tile * key_tile;
   const size_t elements = workspace_elements(query_tile, key_tile);
+  if (elements > workspace_limit / sizeof(float))
+    return fail("attention geometry exceeds the bounded workspace");
   auto *scratch =
       static_cast<float *>(hipdnn_ep_state_ensure_paged_attention_scratch(
           state, elements * sizeof(float)));

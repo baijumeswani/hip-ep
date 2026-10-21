@@ -8006,18 +8006,30 @@ __global__ void matmul_u4_block32_typed_small_m(
       }
       float values[8];
       if constexpr (AlignedK) {
-        const auto *source = reinterpret_cast<const float4 *>(
-            activations + (row + r) * k + column);
-        const float4 low = source[0];
-        const float4 high = source[1];
-        values[0] = low.x;
-        values[1] = low.y;
-        values[2] = low.z;
-        values[3] = low.w;
-        values[4] = high.x;
-        values[5] = high.y;
-        values[6] = high.z;
-        values[7] = high.w;
+        if constexpr (std::is_same_v<Activation, float>) {
+          const auto *source = reinterpret_cast<const float4 *>(
+              activations + (row + r) * k + column);
+          const float4 low = source[0];
+          const float4 high = source[1];
+          values[0] = low.x;
+          values[1] = low.y;
+          values[2] = low.z;
+          values[3] = low.w;
+          values[4] = high.x;
+          values[5] = high.y;
+          values[6] = high.z;
+          values[7] = high.w;
+        } else {
+          const uint4 packed_values = *reinterpret_cast<const uint4 *>(
+              activations + (row + r) * k + column);
+          const uint32_t pairs[4] = {
+              packed_values.x, packed_values.y, packed_values.z, packed_values.w};
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            values[2 * i] = __uint_as_float(pairs[i] << 16);
+            values[2 * i + 1] = __uint_as_float(pairs[i] & 0xffff0000u);
+          }
+        }
       }
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
@@ -8078,13 +8090,9 @@ extern "C" HIP_KERNEL_API int hip_matmul_nbits_gemv_typed(
       launch(activation_tag, scale_tag, aligned_tag, std::integral_constant<int, 4>{});
   };
   const auto launch_scale = [&](auto activation_tag, auto scale_tag) {
-    if constexpr (std::is_same_v<decltype(activation_tag), float>) {
-      if (k % 32 == 0 &&
-          reinterpret_cast<uintptr_t>(activations) % alignof(float4) == 0)
-        launch_rows(activation_tag, scale_tag, std::true_type{});
-      else
-        launch_rows(activation_tag, scale_tag, std::false_type{});
-    } else
+    if (k % 32 == 0 && reinterpret_cast<uintptr_t>(activations) % alignof(uint4) == 0)
+      launch_rows(activation_tag, scale_tag, std::true_type{});
+    else
       launch_rows(activation_tag, scale_tag, std::false_type{});
   };
   const auto dispatch_scales = [&](auto activation_tag) {

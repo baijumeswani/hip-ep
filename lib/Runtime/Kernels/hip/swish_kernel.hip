@@ -133,5 +133,5 @@ extern "C" int hip_swish(void *stream, const void *input, void *output,
   if (error != hipSuccess)
     fprintf(stderr, "[custom_kernels] hip_swish launch failed: %s\n",
             hipGetErrorString(error));
-  return static_cast<int>(error);
+  return hipdnn_device_execution_status(error);
 }

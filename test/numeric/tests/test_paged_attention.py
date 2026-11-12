@@ -552,6 +552,31 @@ def test_int8_attention_tiled_and_long_context(paged_session, prefix, length):
     np.testing.assert_array_equal(tensors["past_value"].numpy(), value)
 
 
+@pytest.mark.parametrize(
+    "prefixes,lengths",
+    [
+        ([0, 257], [1, 7]),
+        ([4095, 8191], [8, 5]),
+        ([32, 512, 1024, 32768], [8, 8, 8, 8]),
+        ([131071], [8]),
+    ],
+)
+def test_int8_attention_short_ragged_queries(paged_session, prefixes, lengths):
+    if not paged_session["quantized"]:
+        pytest.skip("INT8 head-256 path only")
+    inputs = make_inputs(
+        prefixes, lengths, True, np.float32, True, paged_session["residual_bits"]
+    )
+    expected, key, value = reference(inputs)
+    binding, tensors, output = bind(
+        paged_session["session"], paged_session["device"], inputs
+    )
+    paged_session["session"].run_with_iobinding(binding)
+    np.testing.assert_allclose(output.numpy(), expected, atol=0.000002, rtol=0.00002)
+    np.testing.assert_array_equal(tensors["past_key"].numpy(), key)
+    np.testing.assert_array_equal(tensors["past_value"].numpy(), value)
+
+
 @pytest.mark.parametrize("invalid", ["duplicate", "out_of_range", "write_alias"])
 def test_int8_long_page_validation_is_atomic(paged_session, invalid):
     if not paged_session["quantized"]:

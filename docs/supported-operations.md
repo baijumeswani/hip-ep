@@ -41,11 +41,31 @@ aborts directly: fatal logging alone is insufficient because a host logger can
 throw and turn it into a recoverable error. Linux numeric contract tests use a
 test-only interposer to verify this fail-stop behavior without launching a
 destructive GPU fault.
+Swish launch failures are retained in that session status, including their
+device-failure classification; generated graph calls discard individual
+operator return values.
 
 `SkipSimplifiedLayerNormalization` accumulates and normalizes its residual sum
 in FP32, rounding only when storing FP16 outputs. Requesting the optional residual
 output does not change the normalized output; scalar and packed paths are tested
 with and without bias against the ORT CPU implementation.
+
+### Bounded FP32 quantized-cache attention
+
+The separate-QKV, per-channel INT8-cache route retains FP32 unpacking, score
+GEMMs, online softmax and value GEMMs. Its optional eight residual bits make
+each cache value sixteen physical bits; unpacking never rounds through FP16.
+Aligned cache data, scales and output use four-channel vector loads/stores;
+unaligned buffers retain the scalar path with identical arithmetic.
+
+Query tiles use the actual packed token count, capped at one for single-token
+decode and 512 otherwise. Up to 32 packed query tokens use 16,384-key tiles;
+larger prefills use 3,072-key tiles. Tiles shrink as needed to preserve the
+existing 256 MiB scratch ceiling, and unsupported geometry fails before cache
+mutation. FP32 softmax uses wave reductions plus a bounded cross-wave reduction;
+small-row, long-key tiles use more threads without changing precision.
+Ragged verification, page boundaries, cache aliases and invalid-metadata
+atomicity remain covered by the existing numeric tests.
 
 ### Experimental Qwen hybrid target operators
 

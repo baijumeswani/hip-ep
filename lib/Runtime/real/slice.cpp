@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <hip/hip_runtime.h>
 #include <vector>
 
@@ -69,7 +70,7 @@ static int RunSlice(RuntimeState *state, void *data, void *starts, void *ends,
                     const int64_t *output_shape, int64_t output_rank,
                     int64_t starts_num_elements, int64_t axes_num_elements,
                     int64_t steps_num_elements, int64_t data_type,
-                    int64_t index_type) {
+                    int64_t index_type, bool host_indices = false) {
   // (Slice runtime entry trace removed; was used for the slice-empty-buffer
   // root-cause investigation. Re-add with a HIPDNN_EP_DEBUG gate if needed.)
   OP_PROFILE(
@@ -197,6 +198,10 @@ static int RunSlice(RuntimeState *state, void *data, void *starts, void *ends,
 
   auto copyIndices = [&](void *dst, const void *src, int64_t count,
                          const char *what) -> bool {
+    if (host_indices) {
+      std::memcpy(dst, src, static_cast<size_t>(count) * indexBytes);
+      return true;
+    }
     hipError_t copyErr =
         hipMemcpyAsync(dst, src, static_cast<size_t>(count) * indexBytes,
                        hipMemcpyDeviceToHost, hip_stream);
@@ -245,7 +250,7 @@ static int RunSlice(RuntimeState *state, void *data, void *starts, void *ends,
       return -1;
   }
 
-  hipError_t err = hipStreamSynchronize(hip_stream);
+  hipError_t err = host_indices ? hipSuccess : hipStreamSynchronize(hip_stream);
   if (err != hipSuccess) {
     fprintf(stderr, "[REAL] wrap_slice: stream sync after D2H failed: %s\n",
             hipGetErrorString(err));
@@ -448,4 +453,18 @@ int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
       state, data, starts, ends, axes, steps, output, data_shape, data_rank,
       output_shape, output_rank, starts_num_elements, axes_num_elements,
       steps_num_elements, data_type, HIPDNN_EP_DATATYPE_INT64);
+}
+
+int wrap_slice_host(RuntimeState *state, void *data, void *starts, void *ends,
+                    void *axes, void *steps, void *output,
+                    const int64_t *data_shape, int64_t data_rank,
+                    const int64_t *output_shape, int64_t output_rank,
+                    int64_t starts_num_elements, int64_t axes_num_elements,
+                    int64_t steps_num_elements, int64_t data_type,
+                    int64_t index_type) {
+  ExecutionStatusGuard execution_status(state);
+  return execution_status.Finish(RunSlice(
+      state, data, starts, ends, axes, steps, output, data_shape, data_rank,
+      output_shape, output_rank, starts_num_elements, axes_num_elements,
+      steps_num_elements, data_type, index_type, true));
 }

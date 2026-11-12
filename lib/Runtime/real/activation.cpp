@@ -3,6 +3,7 @@
  * Licensed under the MIT License.
  */
 #include "../debug_log.h"
+#include "../execution_status.h"
 #include "../hipdnn_ep_runtime.h"
 #include "../op_profile.h"
 #include "hip_custom_kernels.h"
@@ -326,6 +327,7 @@ int wrap_lrn(RuntimeState *state, const void *input, void *output, int64_t n,
 
 int wrap_swish(RuntimeState *state, void *input, void *output,
                int64_t num_elements, int64_t data_type, double alpha) {
+  ExecutionStatusGuard status_guard(state);
   OP_PROFILE(
       "swish",
       [&] {
@@ -334,7 +336,13 @@ int wrap_swish(RuntimeState *state, void *input, void *output,
         return std::string(b);
       },
       state);
-  if (!state || !input || !output) {
+  if (!state || num_elements < 0) {
+    fprintf(stderr, "[REAL] wrap_swish: invalid state or element count\n");
+    return -1;
+  }
+  if (num_elements == 0)
+    return status_guard.Finish(0);
+  if (!input || !output) {
     fprintf(stderr, "[REAL] wrap_swish: null argument\n");
     return -1;
   }
@@ -355,11 +363,11 @@ int wrap_swish(RuntimeState *state, void *input, void *output,
   int result = hip_swish(stream, input, output, num_elements, hip_dtype, alpha);
   if (result != 0) {
     fprintf(stderr, "[REAL] wrap_swish: kernel launch failed (%d)\n", result);
-    return -1;
+    return status_guard.Finish(result);
   }
 
   RUNTIME_DEBUG_LOG("[REAL] wrap_swish: completed successfully\n");
-  return 0;
+  return status_guard.Finish(0);
 }
 
 int wrap_swiglu(RuntimeState *state, void *gate, void *up, void *output,

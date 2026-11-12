@@ -351,6 +351,15 @@ reductions on its byte-width ABI.
 TopK retains upstream's typed ABI, but rejects BF16 because neither its
 device selection kernels nor its host selector implement BF16 values.
 
+Slice bounds that are all compile-time constants survive conversion and
+bufferization as `hipdnn.constant_{starts,ends,axes,steps}` arrays. LLVM
+lowering materializes host INT64 arrays and calls `wrap_slice_host`; other
+slices retain `wrap_slice_typed` and its synchronized device readback. Both
+entrypoints use the same clamping, logical-extent, zero-tail, and
+empty-accumulator-capacity behavior. Static positive-stride slices still
+prefer zero-copy views. The additional symbol does not change the existing
+runtime entrypoint or artifact ABI.
+
 Runtime ABI version 5 replaces MatMulNBits activation and scale byte widths
 with explicit dtype arguments. Raw symmetric INT4/block-32 supports native
 BF16 activations, bias and output, with FP16, BF16 or FP32 scales. Small-M

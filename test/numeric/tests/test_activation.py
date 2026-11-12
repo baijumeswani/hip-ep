@@ -237,6 +237,24 @@ def _make_quick_gelu_model(dtype, shape: list[int], alpha=None):
     )
 
 
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+@pytest.mark.parametrize("op", ["Swish", "QuickGelu"])
+def test_empty_swish(model_runner, tmp_path, dtype, op):
+    shape = [0, 17]
+    model = (
+        _make_unary_model("Swish", dtype, shape, opset=24)
+        if op == "Swish"
+        else _make_quick_gelu_model(dtype, shape)
+    )
+    path = tmp_path / "empty.onnx"
+    path.write_bytes(model.SerializeToString())
+    # The numeric summary reduces max(abs(error)), which is undefined for empty
+    # arrays. Exercise the same strict backend without that nonempty summary.
+    actual = model_runner.backend.run(str(path), [np.empty(shape, dtype=dtype)])
+    assert len(actual) == 1
+    assert actual[0].shape == tuple(shape) and actual[0].dtype == np.dtype(dtype)
+
+
 class TestMicrosoftQuickGelu:
     """com.microsoft.QuickGelu lowers to hip.swish."""
 

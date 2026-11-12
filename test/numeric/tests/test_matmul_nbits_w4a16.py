@@ -215,7 +215,7 @@ def test_qwen_w4a16_dynamic_shapes(w4a16_weights, request, tmp_path, dtype, k, n
     session = ort.InferenceSession(str(model_path), sess_options=options)
     rng = np.random.default_rng(27)
     # Revisit both dispatch sides after changing M, on the same compiled graph.
-    for rows in (1, 2, 3, 7, 8, 16, 17, 128, 3, 16, 1, 128):
+    for rows in (1, 2, 3, 5, 7, 8, 9, 12, 16, 17, 128, 3, 7, 16, 1, 128):
         source = rng.uniform(-1, 1, (rows, k)).astype(dtype)
         expected = source.astype(np.float32) @ dense.T
         if native_bf16:
@@ -251,8 +251,11 @@ def test_qwen_w4a16_dynamic_shapes(w4a16_weights, request, tmp_path, dtype, k, n
 @pytest.mark.parametrize("k", [32, 65])
 @pytest.mark.parametrize("scale_dtype", [np.float16, np.float32])
 @pytest.mark.parametrize("offsets", [(0, 0), (4, 1)])
-def test_fp32_small_m_element_aligned_inputs(w4a16_weights, k, scale_dtype, offsets):
-    """Caller-owned FP32/byte tensors need not have float4/uint32 alignment."""
+@pytest.mark.parametrize("activation_dtype", [np.float32, bfloat16])
+def test_fp32_small_m_element_aligned_inputs(
+    w4a16_weights, k, scale_dtype, offsets, activation_dtype
+):
+    """Caller-owned typed/byte tensors need not have vector alignment."""
     _, device, _ = w4a16_weights
     memory = device.memory_info(ort.OrtDeviceMemoryType.DEFAULT)
     assert memory.device_id == 0 and memory.device_vendor_id == 0x1002
@@ -268,8 +271,13 @@ def test_fp32_small_m_element_aligned_inputs(w4a16_weights, k, scale_dtype, offs
         )
     )
     kernels = ctypes.CDLL(str(Path(library).resolve()))
-    kernel = kernels.hip_matmul_nbits_gemv_fp32
-    kernel.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * 4
+    native_bf16 = activation_dtype == bfloat16
+    kernel = (
+        kernels.hip_matmul_nbits_gemv_typed
+        if native_bf16
+        else kernels.hip_matmul_nbits_gemv_fp32
+    )
+    kernel.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * (5 if native_bf16 else 4)
     kernel.restype = ctypes.c_int
     stream = ctypes.c_void_p()
     assert hip.hipStreamCreate(ctypes.byref(stream)) == 0
@@ -284,7 +292,7 @@ def test_fp32_small_m_element_aligned_inputs(w4a16_weights, k, scale_dtype, offs
             :, :k
         ]
         for rows in (1, 3, 16):
-            source = rng.uniform(-1, 1, (rows, k)).astype(np.float32)
+            source = rng.uniform(-1, 1, (rows, k)).astype(activation_dtype)
             buffers = []
             pointers = []
             for data, offset in (
@@ -301,7 +309,7 @@ def test_fp32_small_m_element_aligned_inputs(w4a16_weights, k, scale_dtype, offs
                 buffers.append(value)
                 pointers.append(ctypes.c_void_p(value.data_ptr() + offset))
             output = ort.OrtValue.ortvalue_from_shape_and_type(
-                (rows, n), np.float32, memory_info=memory
+                (rows, n), np.uint16 if native_bf16 else np.float32, memory_info=memory
             )
             assert pointers[0].value % 16 == offsets[0]
             assert pointers[1].value % 4 == offsets[1]
@@ -314,13 +322,23 @@ def test_fp32_small_m_element_aligned_inputs(w4a16_weights, k, scale_dtype, offs
                     rows,
                     n,
                     k,
-                    np.dtype(scale_dtype).itemsize,
+                    *(
+                        (5, 1 if scale_dtype == np.float16 else 0)
+                        if native_bf16
+                        else (np.dtype(scale_dtype).itemsize,)
+                    ),
                 )
                 == 0
             )
             assert hip.hipStreamSynchronize(stream) == 0
+            actual = output.numpy()
+            if native_bf16:
+                actual = actual.view(bfloat16).astype(np.float32)
             np.testing.assert_allclose(
-                output.numpy(), source @ dense.T, atol=3e-5, rtol=3e-5
+                actual,
+                source.astype(np.float32) @ dense.T,
+                atol=0.002 if native_bf16 else 3e-5,
+                rtol=0.004 if native_bf16 else 3e-5,
             )
     finally:
         assert hip.hipStreamDestroy(stream) == 0

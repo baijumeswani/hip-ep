@@ -42,6 +42,16 @@ flowchart TD
 
 Key insight: The `.hip` files contain `__global__` kernels compiled by hipcc into fat binaries (host + device code). They live in `custom_kernels_<arch>.{dll,so}` co-located with the EP binary, NOT inside the per-model artifact. `LlvmIrJit` resolves `hip_*` launcher symbols against this shared library at JIT init via `DynamicLibrarySearchGenerator::Load`, anchored on `GetModuleFileName` / `dladdr` of the EP DLL.
 
+## Typed INT4 activation loads
+
+The raw symmetric INT4/block-32 small-M path supports FP32 and BF16
+activations with FP32 accumulation. Aligned BF16 rows load eight values as
+one `uint4` and expand their bit patterns to FP32; this does not round the
+activations or change the dot-product accumulation order. Vector loading
+requires a 16-byte-aligned activation pointer and K divisible by 32. Other
+inputs retain the scalar tail-safe path. One-/four-row weight sharing and
+the bounded tiled-dequantization path for larger M are unchanged.
+
 ## Directory Structure
 
 ```
